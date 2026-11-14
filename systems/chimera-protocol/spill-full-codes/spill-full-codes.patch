@@ -1,0 +1,488 @@
+--- a/cpp/apps/build.cpp
++++ b/cpp/apps/build.cpp
+@@ -24,6 +24,8 @@
+ 
+     auto doc_lens = load_doclens(args.doclens_file);
+     chimera_index index;
++    Chimera::BuildOptions build_options;
++    build_options.spill_full_codes_path = args.spill_full_codes_path;
+     if (!args.fp16_npy_file.empty()) {
+         if (doc_lens.empty()) throw std::invalid_argument("Document lengths must not be empty");
+         size_t tokens = 0;
+@@ -37,11 +39,11 @@
+         std::cout << "[BUILD] input=FP16-NPY values=" << embeddings.size()
+                   << " dimension=" << embeddings.dimension() << '\n';
+         index.build_from_f16_ptr(embeddings.data(), embeddings.size(), embeddings.dimension(),
+-                                 doc_lens, args.n_clusters, args.ex_bits);
++                                 doc_lens, args.n_clusters, args.ex_bits, {}, build_options);
+     } else {
+         MappedEmbeddings embeddings(args.data_file);
+         index.build_from_ptr(embeddings.data(), embeddings.size(), embeddings.dimension(),
+-                             doc_lens, args.n_clusters, args.ex_bits);
++                             doc_lens, args.n_clusters, args.ex_bits, {}, build_options);
+     }
+     index.save(args.index_dir);
+     return 0;
+--- a/cpp/apps/utils.cpp
++++ b/cpp/apps/utils.cpp
+@@ -71,6 +71,8 @@
+             args.doclens_file = require_value(argc, argv, i, arg);
+         } else if (arg == "--data") {
+             args.data_file = require_value(argc, argv, i, arg);
++        } else if (arg == "--spill-full-codes") {
++            args.spill_full_codes_path = require_value(argc, argv, i, arg);
+         } else if (arg == "--fp16-npy") {
+             args.fp16_npy_file = require_value(argc, argv, i, arg);
+         } else if (arg == "--n-clusters") {
+@@ -172,6 +174,7 @@
+         << "  --index, -i      Output index directory.\n"
+         << "  --doclens, -d    Input document-length file.\n"
+         << "  --data           Original raw FP32 token-embedding file.\n"
++        << "  --spill-full-codes <path>  Exclusive temporary file; same filesystem as index.\n"
+         << "  --fp16-npy       Read-only C-order NPY <u2 raw FP16 bits or <f2 matrix.\n"
+         << "  --n-clusters     Number of centroids in the CAGRA graph.\n"
+         << "  --ex-bits        Residual quantization bits per dimension (1-7).\n";
+--- a/cpp/apps/utils.hpp
++++ b/cpp/apps/utils.hpp
+@@ -18,6 +18,7 @@
+     std::string doclens_file;
+     size_t n_clusters = 0;
+     size_t ex_bits = 0;
++    std::string spill_full_codes_path;
+ };
+ 
+ struct SearchCliArgs {
+--- a/cpp/include/chimera/chimera_index.cuh
++++ b/cpp/include/chimera/chimera_index.cuh
+@@ -24,6 +24,12 @@
+ struct IVF_PG;
+ class FloatInputView;
+ class ReadOnlyMappedFile;
++class SpilledFullCodes;
++
++struct BuildOptions {
++    std::string spill_full_codes_path;
++    size_t spill_flush_bytes = 64ull * 1024ull * 1024ull;
++};
+ 
+ struct LoadOptions {
+     bool low_memory = false;
+@@ -83,6 +89,38 @@
+         size_t ex_bits,
+         const SearchOptions& options = {});
+ 
++    void build(
++        const std::vector<float>& embeddings,
++        size_t dimension,
++        const std::vector<int>& doc_lens,
++        size_t n_clusters,
++        size_t ex_bits,
++        const SearchOptions& options,
++        const BuildOptions& build_options);
++
++    // Non-owning FP32 input; keep storage alive until this synchronous call returns.
++    // embedding_values is the number of floats, not the number of token vectors.
++    void build_from_ptr(
++        const float* embeddings,
++        size_t embedding_values,
++        size_t dimension,
++        const std::vector<int>& doc_lens,
++        size_t n_clusters,
++        size_t ex_bits,
++        const SearchOptions& options,
++        const BuildOptions& build_options);
++
++    // IEEE FP16 bit patterns. Expanded exactly to FP32 in bounded CPU buffers.
++    void build_from_f16_ptr(
++        const uint16_t* embeddings,
++        size_t embedding_values,
++        size_t dimension,
++        const std::vector<int>& doc_lens,
++        size_t n_clusters,
++        size_t ex_bits,
++        const SearchOptions& options,
++        const BuildOptions& build_options);
++
+     std::vector<size_t> search(
+         const std::vector<float>& query,
+         size_t k);
+@@ -115,7 +153,9 @@
+         const std::vector<int>& doc_lens,
+         size_t n_clusters,
+         size_t ex_bits,
+-        const SearchOptions& options);
++        const SearchOptions& options,
++        const BuildOptions& build_options = {});
++    const char* full_bit_codes_data() const;
+ 
+     struct QueryState;
+ 
+@@ -179,6 +219,7 @@
+     rabitqlib::Rotator<float>* rotator_ = nullptr;
+     IVF_PG* ivf = nullptr;
+     std::vector<char> full_bit_codes_;
++    std::unique_ptr<SpilledFullCodes> spilled_full_bit_codes_;
+     std::unique_ptr<ReadOnlyMappedFile> mapped_full_bit_codes_;
+     const char* mapped_full_bit_data_ = nullptr;
+     LoadOptions load_options_;
+--- /dev/null
++++ b/cpp/include/chimera/spilled_full_codes.hpp
+@@ -0,0 +1,141 @@
++#pragma once
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <algorithm>
++#include <cerrno>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <limits>
++#include <numeric>
++#include <stdexcept>
++#include <string>
++
++namespace Chimera {
++
++// Owns exactly one O_EXCL-created temporary name. Saved hardlinks are never removed.
++class SpilledFullCodes {
++ public:
++    SpilledFullCodes(const std::string& path, size_t bytes,
++                     size_t flush_bytes = 64ull * 1024ull * 1024ull)
++        : path_(std::filesystem::absolute(path).lexically_normal().string()),
++          bytes_(bytes), flush_bytes_(flush_bytes) {
++        if (bytes == 0 || bytes > static_cast<uintmax_t>(std::numeric_limits<off_t>::max()) || flush_bytes == 0) {
++            throw std::invalid_argument("Spill size and flush window must be positive and fit off_t");
++        }
++        fd_ = ::open(path_.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
++        if (fd_ < 0) fail("exclusive spill create");
++        try {
++            struct stat state {};
++            if (::fstat(fd_, &state) != 0) fail("spill fstat");
++            device_ = state.st_dev; inode_ = state.st_ino; identity_known_ = true;
++            // Fail ENOSPC before encoding; reserved extents read as zero like vector<char>.
++            const int error = ::posix_fallocate(fd_, 0, static_cast<off_t>(bytes_));
++            if (error != 0) { errno = error; fail("spill disk reservation"); }
++            mapping_ = ::mmap(nullptr, bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
++            if (mapping_ == MAP_FAILED) fail("shared spill mmap");
++        } catch (...) { cleanup(); throw; }
++    }
++    ~SpilledFullCodes() { cleanup(); }
++    SpilledFullCodes(const SpilledFullCodes&) = delete;
++    SpilledFullCodes& operator=(const SpilledFullCodes&) = delete;
++    char* data() { return static_cast<char*>(mapping_); }
++    const char* data() const { return static_cast<const char*>(mapping_); }
++    size_t size() const { return bytes_; }
++    const std::string& temporary_path() const { return path_; }
++
++    size_t rows_per_flush(size_t stride) const {
++        if (stride == 0) throw std::invalid_argument("Full-code stride must be positive");
++        const size_t page = page_size();
++        const size_t alignment_rows = page / std::gcd(page, stride);
++        const size_t rows = std::max<size_t>(1, flush_bytes_ / stride);
++        return std::max(alignment_rows, rows / alignment_rows * alignment_rows);
++    }
++    void sync_and_drop(size_t offset, size_t count) {
++        if (offset > bytes_ || count > bytes_ - offset) throw std::out_of_range("Spill flush exceeds mapping");
++        if (count == 0) return;
++        const size_t aligned = offset / page_size() * page_size();
++        void* begin = data() + aligned;
++        const size_t length = offset - aligned + count;
++        if (::msync(begin, length, MS_SYNC) != 0) fail("spill writeback");
++        if (::madvise(begin, length, MADV_DONTNEED) != 0) fail("spill clean-page release");
++    }
++
++    // Read-only preflight, invoked before the original save touches output files.
++    void preflight_save_directory(const std::string& index_dir) const {
++        validate_name();
++        const auto destination = std::filesystem::weakly_canonical(std::filesystem::absolute(index_dir));
++        const auto source = std::filesystem::weakly_canonical(path_);
++        for (auto parent = source.parent_path(); !parent.empty();) {
++            if (parent == destination) {
++                throw std::invalid_argument("Spill temporary must be outside the saved index directory");
++            }
++            const auto next = parent.parent_path();
++            if (next == parent) break;
++            parent = next;
++        }
++        auto existing = destination;
++        while (!std::filesystem::exists(existing)) {
++            const auto next = existing.parent_path();
++            if (next == existing || next.empty()) throw std::runtime_error("No existing save ancestor");
++            existing = next;
++        }
++        struct stat state {};
++        if (::stat(existing.c_str(), &state) != 0) fail("save ancestor stat");
++        if (!S_ISDIR(state.st_mode) || state.st_dev != device_) {
++            throw std::runtime_error("Spill and index must be on the same filesystem for hardlink save");
++        }
++    }
++    void publish_hardlink(const std::string& target) const {
++        validate_name();
++        if (::msync(mapping_, bytes_, MS_SYNC) != 0 || ::fdatasync(fd_) != 0) fail("spill final sync");
++        // Does not replace an existing name; normal save prepares the destination.
++        if (::link(path_.c_str(), target.c_str()) != 0) fail("spill hardlink publish");
++        const auto parent = std::filesystem::path(target).parent_path();
++        const int directory = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++        if (directory < 0) fail("saved index directory open");
++        const int status = ::fsync(directory);
++        const int error = errno;
++        (void)::close(directory);
++        if (status != 0) { errno = error; fail("saved index directory sync"); }
++    }
++ private:
++    static size_t page_size() {
++        const long value = ::sysconf(_SC_PAGESIZE);
++        return value > 0 ? static_cast<size_t>(value) : 4096;
++    }
++    void validate_name() const {
++        struct stat state {};
++        if (::lstat(path_.c_str(), &state) != 0 || !S_ISREG(state.st_mode) ||
++            state.st_dev != device_ || state.st_ino != inode_ ||
++            state.st_size < 0 || static_cast<uintmax_t>(state.st_size) != bytes_) {
++            throw std::runtime_error("Spill temporary name/identity/length changed: " + path_);
++        }
++    }
++    [[noreturn]] void fail(const char* operation) const {
++        const int error = errno;
++        throw std::runtime_error(std::string(operation) + " failed for " + path_ + ": " + std::strerror(error));
++    }
++    void cleanup() noexcept {
++        if (mapping_ != MAP_FAILED) { (void)::munmap(mapping_, bytes_); mapping_ = MAP_FAILED; }
++        if (fd_ >= 0) { (void)::close(fd_); fd_ = -1; }
++        struct stat state {};
++        if (identity_known_ && ::lstat(path_.c_str(), &state) == 0 && S_ISREG(state.st_mode) &&
++            state.st_dev == device_ && state.st_ino == inode_) {
++            (void)::unlink(path_.c_str());
++        }
++    }
++    std::string path_;
++    size_t bytes_ = 0;
++    size_t flush_bytes_ = 0;
++    int fd_ = -1;
++    void* mapping_ = MAP_FAILED;
++    dev_t device_ {};
++    ino_t inode_ {};
++    bool identity_known_ = false;
++};
++
++}  // namespace Chimera
+--- a/cpp/src/build_index.cu
++++ b/cpp/src/build_index.cu
+@@ -1,3 +1,4 @@
++#include "chimera/spilled_full_codes.hpp"
+ #include <cuda_runtime.h>
+ #include <thrust/device_vector.h>
+ 
+@@ -269,6 +270,7 @@
+ struct EncodedDocuments {
+     std::vector<uint64_t> one_bit_codes;
+     std::vector<char> full_codes;
++    std::unique_ptr<SpilledFullCodes> spilled_codes;
+     std::vector<float> one_bit_factors;
+     std::vector<float> full_code_factors;
+ };
+@@ -278,27 +280,40 @@
+     size_t num_embeddings,
+     size_t dimension,
+     size_t ex_bits,
+-    const Rotator<float>& rotator) {
++    const Rotator<float>& rotator,
++    const BuildOptions& build_options) {
+     const size_t one_bit_words_per_vector = PADDED_DIM / 64;
+     const size_t full_code_bytes_per_vector = PADDED_DIM * (1 + ex_bits) / 8;
+ 
+     EncodedDocuments encoded {
+         std::vector<uint64_t>(checked_product(
+             num_embeddings, one_bit_words_per_vector, "one-bit codes")),
+-        std::vector<char>(checked_product(
+-            num_embeddings, full_code_bytes_per_vector, "full codes")),
++        std::vector<char>(build_options.spill_full_codes_path.empty() ? checked_product(
++            num_embeddings, full_code_bytes_per_vector, "full codes") : 0),
++        nullptr,
+         std::vector<float>(num_embeddings),
+         std::vector<float>(num_embeddings),
+     };
+ 
++    if (!build_options.spill_full_codes_path.empty()) {
++        encoded.spilled_codes = std::make_unique<SpilledFullCodes>(
++            build_options.spill_full_codes_path,
++            checked_product(num_embeddings, full_code_bytes_per_vector, "full codes"),
++            build_options.spill_flush_bytes);
++    }
++    char* full_codes = encoded.spilled_codes ? encoded.spilled_codes->data() : encoded.full_codes.data();
++    const size_t rows_per_flush = encoded.spilled_codes
++        ? encoded.spilled_codes->rows_per_flush(full_code_bytes_per_vector) : num_embeddings;
++    for (size_t first = 0; first < num_embeddings;) {
++        const size_t last = first + std::min(rows_per_flush, num_embeddings - first);
+ #pragma omp parallel
+     {
+         std::vector<float> rotated(PADDED_DIM);
+         std::array<float, PADDED_DIM> expanded_row;
+ 
+ #pragma omp for schedule(static)
+-        for (std::int64_t row = 0;
+-             row < static_cast<std::int64_t>(num_embeddings);
++        for (std::int64_t row = static_cast<std::int64_t>(first);
++             row < static_cast<std::int64_t>(last);
+              ++row) {
+             const size_t index = static_cast<size_t>(row);
+             rotator.rotate(
+@@ -313,9 +328,14 @@
+                 rotated.data(),
+                 PADDED_DIM,
+                 ex_bits,
+-                reinterpret_cast<uint8_t*>(encoded.full_codes.data()) + index * full_code_bytes_per_vector,
++                reinterpret_cast<uint8_t*>(full_codes) + index * full_code_bytes_per_vector,
+                 &encoded.full_code_factors[index]);
+         }
++    }
++
++        if (encoded.spilled_codes) encoded.spilled_codes->sync_and_drop(
++            first * full_code_bytes_per_vector, (last - first) * full_code_bytes_per_vector);
++        first = last;
+     }
+ 
+     return encoded;
+@@ -437,13 +457,52 @@
+                     doc_lens, n_clusters, ex_bits, options);
+ }
+ 
++void chimera_index::build(
++    const std::vector<float>& embeddings,
++    size_t dimension,
++    const std::vector<int>& doc_lens,
++    size_t n_clusters,
++    size_t ex_bits,
++    const SearchOptions& options,
++    const BuildOptions& build_options) {
++    build_from_ptr(embeddings.data(), embeddings.size(), dimension, doc_lens,
++                   n_clusters, ex_bits, options, build_options);
++}
++
++void chimera_index::build_from_ptr(
++    const float* embedding_data,
++    size_t embedding_values,
++    size_t dimension,
++    const std::vector<int>& doc_lens,
++    size_t n_clusters,
++    size_t ex_bits,
++    const SearchOptions& options,
++    const BuildOptions& build_options) {
++    build_from_view(FloatInputView(embedding_data, embedding_values), dimension,
++                    doc_lens, n_clusters, ex_bits, options, build_options);
++}
++
++void chimera_index::build_from_f16_ptr(
++    const uint16_t* embedding_data,
++    size_t embedding_values,
++    size_t dimension,
++    const std::vector<int>& doc_lens,
++    size_t n_clusters,
++    size_t ex_bits,
++    const SearchOptions& options,
++    const BuildOptions& build_options) {
++    build_from_view(FloatInputView(embedding_data, embedding_values), dimension,
++                    doc_lens, n_clusters, ex_bits, options, build_options);
++}
++
+ void chimera_index::build_from_view(
+     const FloatInputView& embeddings,
+     size_t dimension,
+     const std::vector<int>& doc_lens,
+     size_t n_clusters,
+     size_t ex_bits,
+-    const SearchOptions& options) {
++    const SearchOptions& options,
++    const BuildOptions& build_options) {
+     validate_search_options(options);
+     const size_t num_embeddings = validate_build_inputs(
+         embeddings,
+@@ -505,7 +564,7 @@
+         num_embeddings,
+         dimension,
+         ex_bits,
+-        *rotator);
++        *rotator, build_options);
+     auto token_doc_ids = make_token_doc_ids(doc_lens, num_embeddings);
+     auto clustered = reorder_by_cluster(encoded, *ivf, token_doc_ids);
+     release_vector(token_doc_ids);
+@@ -515,6 +574,7 @@
+     one_bit_factors_ = std::move(encoded.one_bit_factors);
+     full_bit_factors_ = std::move(encoded.full_code_factors);
+     full_bit_codes_ = std::move(encoded.full_codes);
++    spilled_full_bit_codes_ = std::move(encoded.spilled_codes);
+     clustered_data_ = std::move(clustered);
+ 
+     has_index_ = true;
+@@ -527,6 +587,7 @@
+         throw std::runtime_error("Cannot save an empty Chimera index");
+     }
+ 
++    if (spilled_full_bit_codes_) spilled_full_bit_codes_->preflight_save_directory(index_dir);
+     prepare_output_directory(index_dir);
+     const std::filesystem::path output_dir(index_dir);
+     const auto doclens_path = (output_dir / "doclens.bin").string();
+@@ -565,11 +626,15 @@
+             full_bit_factors_.size() * sizeof(float)));
+     finish_output(one_bit_output, doc_one_bit_path);
+ 
++    if (spilled_full_bit_codes_) {
++        spilled_full_bit_codes_->publish_hardlink(doc_full_path);
++    } else {
+     auto full_code_output = open_binary_output(doc_full_path);
+     full_code_output.write(
+         full_bit_codes_.data(),
+         static_cast<std::streamsize>(full_bit_codes_.size()));
+     finish_output(full_code_output, doc_full_path);
++    }
+ 
+     auto clustered_output = open_binary_output(cluster_one_bit_path);
+     clustered_output.write(
+--- a/cpp/src/chimera_index.cu
++++ b/cpp/src/chimera_index.cu
+@@ -1,3 +1,4 @@
++#include "chimera/spilled_full_codes.hpp"
+ #include <cuda_runtime.h>
+ 
+ #include "chimera/chimera_index.cuh"
+--- a/cpp/src/cpu_scoring.cpp
++++ b/cpp/src/cpu_scoring.cpp
+@@ -16,8 +16,7 @@
+ ) {
+     ProfileRange range(profiling_enabled_, "Chimera/cpu_fullbit", num_full_bit_candidates);
+     const size_t full_bit_codes_stride = PADDED_DIM * (1 + ex_bits) / 8;
+-    const char* full_bit_codes = mapped_full_bit_data_ != nullptr
+-        ? mapped_full_bit_data_ : full_bit_codes_.data();
++    const char* full_bit_codes = full_bit_codes_data();
+     const auto& full_bit_factors = full_bit_factors_;
+     alignas(64) float cbex_sumq_arr[Q_DOCLEN];
+     for (size_t j = 0; j < Q_DOCLEN; j++)
+--- a/cpp/src/utils.cu
++++ b/cpp/src/utils.cu
+@@ -1,3 +1,4 @@
++#include "chimera/spilled_full_codes.hpp"
+ #include <cuda_runtime.h>
+ #include <cub/cub.cuh>
+ #include <thrust/device_ptr.h>
+@@ -533,6 +534,7 @@
+     d_clustered_doc_ids_ = nullptr;
+     d_token_to_cluster_pos_ = nullptr;
+ 
++    spilled_full_bit_codes_.reset();
+     mapped_full_bit_data_ = nullptr;
+     mapped_full_bit_codes_.reset();
+     low_memory_load_ = false;
+@@ -556,3 +558,10 @@
+ }
+ 
+ }  // namespace Chimera
++
++namespace Chimera {
++const char* chimera_index::full_bit_codes_data() const {
++    if (spilled_full_bit_codes_) return spilled_full_bit_codes_->data();
++    return mapped_full_bit_data_ ? mapped_full_bit_data_ : full_bit_codes_.data();
++}
++}

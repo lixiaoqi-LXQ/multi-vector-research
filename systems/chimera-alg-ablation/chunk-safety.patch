@@ -1,0 +1,105 @@
+--- a/cpp/src/search_impl.cu
++++ b/cpp/src/search_impl.cu
+@@ -9,6 +9,7 @@
+ #define EIGEN_NO_CUDA
+ 
+ #include "chimera/config.cuh"
++#include "chimera/chunk_partition.hpp"
+ #include "chimera/profiling.hpp"
+ #include "chimera/ivf_pg.hpp"
+ #include "chimera/kernels.cuh"
+@@ -344,10 +345,9 @@
+     while (score_threads < Q_DOCLEN && score_threads < 256) score_threads *= 2;
+     score_threads = std::min(score_threads, 256);
+ 
+-    const int num_chunks =
+-        std::min(options_.num_chunks, num_refined_candidates);
+-    const int chunk_size =
+-        (num_refined_candidates + num_chunks - 1) / num_chunks;
++    const auto partition = ceil_chunk_partition(num_refined_candidates, options_.num_chunks);
++    const int num_chunks = partition.first;
++    const int chunk_size = partition.second;
+ 
+     std::vector<cudaEvent_t> chunk_compute_done(num_chunks);
+     std::vector<cudaEvent_t> chunk_d2h_done(num_chunks);
+@@ -360,9 +360,9 @@
+ 
+     auto launch_chunk_compute = [&](int chunk) {
+         ProfileRange gpu_range(profiling_enabled_, "Chimera/gpu_chunk_submission", chunk);
+-        const int chunk_start = chunk * chunk_size;
+-        const int chunk_end = std::min(
+-            chunk_start + chunk_size, num_refined_candidates);
++        const auto bounds = clamped_chunk_bounds(num_refined_candidates, chunk_size, chunk);
++        const int chunk_start = bounds.first;
++        const int chunk_end = bounds.second;
+         const int chunk_count = chunk_end - chunk_start;
+         const size_t token_start =
+             ws_->h_pinned_refined_doc_offsets[chunk_start];
+@@ -388,6 +388,7 @@
+             check_cuda(cudaGetLastError());
+         }
+ 
++        if (chunk_count > 0) {
+         one_bit_document_score_kernel<<<
+             chunk_count, score_threads, 0, stream>>>(
+             ws_->d_one_bit_token_scores,
+@@ -396,12 +397,13 @@
+             total_tokens,
+             chunk_count);
+         check_cuda(cudaGetLastError());
++        }
+ 
+         check_cuda(cudaEventRecord(chunk_compute_done[chunk], stream));
+ 
+         check_cuda(cudaStreamWaitEvent(
+             stream_d2h, chunk_compute_done[chunk], 0));
+-        check_cuda(cudaMemcpyAsync(
++        if (chunk_count > 0) check_cuda(cudaMemcpyAsync(
+             ws_->h_mapped_one_bit_document_scores + chunk_start,
+             ws_->d_one_bit_document_scores + chunk_start,
+             chunk_count * sizeof(float),
+@@ -424,9 +426,9 @@
+     auto& full_bit_scores = ws_->full_bit_scores;
+ 
+     for (int chunk = 0; chunk < num_chunks; ++chunk) {
+-        const int chunk_start = chunk * chunk_size;
+-        const int chunk_end = std::min(
+-            chunk_start + chunk_size, num_refined_candidates);
++        const auto bounds = clamped_chunk_bounds(num_refined_candidates, chunk_size, chunk);
++        const int chunk_start = bounds.first;
++        const int chunk_end = bounds.second;
+         const int chunk_count = chunk_end - chunk_start;
+         {
+             ProfileRange wait(profiling_enabled_, "Chimera/wait_chunk", chunk);
+@@ -449,7 +451,7 @@
+             one_bit_score_order.begin() + merge_size,
+             descending_one_bit_score);
+         const int cumulative_full_bit_target = std::min(
+-            full_bit_target * (chunk + 1) / num_chunks, carry_size);
++            int((int64_t(full_bit_target) * (chunk + 1)) / num_chunks), carry_size);
+         std::nth_element(
+             one_bit_score_order.begin(),
+             one_bit_score_order.begin() + cumulative_full_bit_target,
+--- /dev/null
++++ b/cpp/include/chimera/chunk_partition.hpp
+@@ -0,0 +1,20 @@
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <stdexcept>
++#include <utility>
++namespace Chimera {
++// Preserve original chunk count, ceil size and cumulative-budget denominator.
++inline std::pair<int,int> ceil_chunk_partition(int documents, int requested_chunks) {
++    if (documents < 0 || requested_chunks <= 0) throw std::invalid_argument("Invalid document chunk shape");
++    if (!documents) return {0, 0};
++    const int count = std::min(requested_chunks, documents);
++    return {count, documents / count + (documents % count != 0)};
++}
++inline std::pair<int,int> clamped_chunk_bounds(int documents, int size, int chunk) {
++    if (documents < 0 || size <= 0 || chunk < 0) throw std::invalid_argument("Invalid document chunk range");
++    const int start = int(std::min(int64_t(documents), int64_t(chunk) * size));
++    const int end = int(std::min(int64_t(documents), int64_t(start) + size));
++    return {start, end};
++}
++}

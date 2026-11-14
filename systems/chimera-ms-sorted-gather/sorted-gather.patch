@@ -1,0 +1,17 @@
+--- a/cpp/src/build_index.cu
++++ b/cpp/src/build_index.cu
+@@ -187,7 +187,13 @@
+     }
+ 
+     std::vector<float> centroids(checked_product(n_clusters, dimension, "centroids"));
+-    for (size_t cluster = 0; cluster < n_clusters; ++cluster) {
++    // Preserve reservoir IDs and centroid slots; gather immutable source rows in order.
++    std::vector<size_t> read_order(n_clusters);
++    std::iota(read_order.begin(), read_order.end(), size_t {0});
++    std::sort(read_order.begin(), read_order.end(), [&](size_t a, size_t b) {
++        return sampled_ids[a] != sampled_ids[b] ? sampled_ids[a] < sampled_ids[b] : a < b;
++    });
++    for (size_t cluster : read_order) {
+         embeddings.copy_to(
+             centroids.data() + cluster * dimension,
+             sampled_ids[cluster] * dimension, dimension);

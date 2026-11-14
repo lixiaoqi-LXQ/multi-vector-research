@@ -1,0 +1,538 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -25,6 +25,7 @@
+ endif()
+ 
+ find_package(OpenMP REQUIRED)
++find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+ find_package(cuvs REQUIRED)
+ find_package(rmm REQUIRED)
+ enable_language(CUDA)
+@@ -52,6 +53,7 @@
+ add_library(chimera_core STATIC
+     cpp/third_party/rabitqlib/utils/fht_avx.cpp
+     cpp/src/build_index.cu
++    cpp/src/build_checkpoint.cpp
+     cpp/src/chimera_index.cu
+     cpp/src/io.cpp
+     cpp/src/fp16_input.cpp
+@@ -68,6 +70,7 @@
+ )
+ target_link_libraries(chimera_core PUBLIC
+     OpenMP::OpenMP_CXX
++    OpenSSL::Crypto
+     cuvs::cuvs
+     rmm::rmm
+ )
+--- a/cpp/apps/build.cpp
++++ b/cpp/apps/build.cpp
+@@ -22,10 +22,15 @@
+         return 1;
+     }
+ 
++    try {
+     auto doc_lens = load_doclens(args.doclens_file);
+     chimera_index index;
+     Chimera::BuildOptions build_options;
+     build_options.spill_full_codes_path = args.spill_full_codes_path;
++    build_options.checkpoint_dir = args.checkpoint_dir;
++    build_options.checkpoint_identity_sha256 = args.checkpoint_identity_sha256;
++    build_options.resume_checkpoint = args.resume_checkpoint;
++    build_options.stop_after_assignment_batches = args.stop_after_assignment_batches;
+     if (!args.fp16_npy_file.empty()) {
+         if (doc_lens.empty()) throw std::invalid_argument("Document lengths must not be empty");
+         size_t tokens = 0;
+@@ -47,4 +52,11 @@
+     }
+     index.save(args.index_dir);
+     return 0;
++    } catch (const BuildCheckpointStop& e) {
++        std::cerr << "[BUILD_CHECKPOINT] " << e.what() << std::endl;
++        return 3;
++    } catch (const std::exception& e) {
++        std::cerr << "Build error: " << e.what() << std::endl;
++        return 1;
++    }
+ }
+--- a/cpp/apps/utils.cpp
++++ b/cpp/apps/utils.cpp
+@@ -73,6 +73,14 @@
+             args.data_file = require_value(argc, argv, i, arg);
+         } else if (arg == "--spill-full-codes") {
+             args.spill_full_codes_path = require_value(argc, argv, i, arg);
++        } else if (arg == "--build-checkpoint-dir") {
++            args.checkpoint_dir = require_value(argc, argv, i, arg);
++        } else if (arg == "--build-checkpoint-identity-sha256") {
++            args.checkpoint_identity_sha256 = require_value(argc, argv, i, arg);
++        } else if (arg == "--resume-build-checkpoint") {
++            args.resume_checkpoint = true;
++        } else if (arg == "--stop-after-assignment-batches") {
++            args.stop_after_assignment_batches = std::stoull(require_value(argc, argv, i, arg));
+         } else if (arg == "--fp16-npy") {
+             args.fp16_npy_file = require_value(argc, argv, i, arg);
+         } else if (arg == "--n-clusters") {
+@@ -91,6 +99,10 @@
+         args.n_clusters == 0 || args.ex_bits == 0) {
+         throw std::runtime_error("Missing required arguments.");
+     }
++    if ((!args.checkpoint_dir.empty()) != (!args.checkpoint_identity_sha256.empty()))
++        throw std::runtime_error("Checkpoint directory and identity SHA must be supplied together");
++    if ((args.resume_checkpoint || args.stop_after_assignment_batches) && args.checkpoint_dir.empty())
++        throw std::runtime_error("Checkpoint stop/resume requires --build-checkpoint-dir");
+     return args;
+ }
+ 
+@@ -175,6 +187,10 @@
+         << "  --doclens, -d    Input document-length file.\n"
+         << "  --data           Original raw FP32 token-embedding file.\n"
+         << "  --spill-full-codes <path>  Exclusive temporary file; same filesystem as index.\n"
++        << "  --build-checkpoint-dir <dir>  Optional exclusive durable centroid/graph/labels cache.\n"
++        << "  --build-checkpoint-identity-sha256 <sha>  Use the verified identity wrapper.\n"
++        << "  --resume-build-checkpoint  Resume only matching committed state.\n"
++        << "  --stop-after-assignment-batches <n>  Commit n new batches then exit3; no final index.\n"
+         << "  --fp16-npy       Read-only C-order NPY <u2 raw FP16 bits or <f2 matrix.\n"
+         << "  --n-clusters     Number of centroids in the CAGRA graph.\n"
+         << "  --ex-bits        Residual quantization bits per dimension (1-7).\n";
+--- a/cpp/apps/utils.hpp
++++ b/cpp/apps/utils.hpp
+@@ -19,6 +19,10 @@
+     size_t n_clusters = 0;
+     size_t ex_bits = 0;
+     std::string spill_full_codes_path;
++    std::string checkpoint_dir;
++    std::string checkpoint_identity_sha256;
++    bool resume_checkpoint = false;
++    size_t stop_after_assignment_batches = 0;
+ };
+ 
+ struct SearchCliArgs {
+--- /dev/null
++++ b/cpp/include/chimera/build_checkpoint.hpp
+@@ -0,0 +1,50 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <filesystem>
++#include <string>
++#include <vector>
++
++namespace Chimera {
++struct AssignmentCheckpointConfig {
++    std::string identity_sha256;
++    std::string doclens_sha256;
++    size_t tokens = 0, dimension = 0, clusters = 0, ex_bits = 0;
++    size_t batch_size = 65536, sample_seed = 42, rotator_seed = 42;
++    size_t assignment_k = 1, assignment_itopk = 150;
++};
++std::string checkpoint_sha256(const void*, size_t);
++std::string checkpoint_file_sha256(const std::filesystem::path&);
++// Metadata/files are exclusive to one builder. Failed uncommitted files are retained as orphans.
++class AssignmentCheckpoint {
++ public:
++    AssignmentCheckpoint(const std::string&, const AssignmentCheckpointConfig&, bool resume);
++    ~AssignmentCheckpoint();
++    AssignmentCheckpoint(const AssignmentCheckpoint&) = delete;
++    AssignmentCheckpoint& operator=(const AssignmentCheckpoint&) = delete;
++    bool has_centroids() const;
++    bool has_graph() const;
++    size_t completed_tokens() const { return done_; }
++    std::vector<float> load_centroids() const;
++    void save_centroids(const std::vector<float>&);
++    std::filesystem::path reserve_graph_temporary();
++    void commit_graph(const std::filesystem::path&);
++    std::string graph_path() const;
++    void load_labels(std::vector<uint32_t>&) const;
++    void append_labels(size_t start, const uint32_t*, size_t count);
++ private:
++    struct Artifact { size_t bytes = 0; std::string sha = "-"; };
++    struct Chunk { size_t start, count; std::string sha; };
++    void write_state();
++    void read_state();
++    void validate() const;
++    std::filesystem::path chunk_path(size_t) const;
++    std::filesystem::path root_;
++    AssignmentCheckpointConfig config_;
++    Artifact centroids_, graph_;
++    size_t done_ = 0;
++    std::string labels_sha_ = "-";
++    std::vector<Chunk> chunks_;
++    int lock_fd_ = -1;
++};
++}  // namespace Chimera
+--- a/cpp/include/chimera/chimera_index.cuh
++++ b/cpp/include/chimera/chimera_index.cuh
+@@ -26,9 +26,18 @@
+ class ReadOnlyMappedFile;
+ class SpilledFullCodes;
+ 
++class BuildCheckpointStop final : public std::exception {
++ public:
++    const char* what() const noexcept override { return "Assignment prefix committed; intentional checkpoint stop"; }
++};
++
+ struct BuildOptions {
+     std::string spill_full_codes_path;
+     size_t spill_flush_bytes = 64ull * 1024ull * 1024ull;
++    std::string checkpoint_dir;
++    std::string checkpoint_identity_sha256;
++    bool resume_checkpoint = false;
++    size_t stop_after_assignment_batches = 0;
+ };
+ 
+ struct LoadOptions {
+--- /dev/null
++++ b/cpp/src/build_checkpoint.cpp
+@@ -0,0 +1,191 @@
++#include "chimera/build_checkpoint.hpp"
++#include <openssl/evp.h>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <array>
++#include <algorithm>
++#include <cerrno>
++#include <cstring>
++#include <fstream>
++#include <iomanip>
++#include <limits>
++#include <memory>
++#include <sstream>
++#include <stdexcept>
++#include <utility>
++
++namespace Chimera {
++namespace {
++namespace fs = std::filesystem;
++void need(bool value, const std::string& message) {
++    if (!value) throw std::runtime_error("Build checkpoint: " + message);
++}
++struct Digest {
++    EVP_MD_CTX* p = EVP_MD_CTX_new();
++    Digest() { need(p && EVP_DigestInit_ex(p, EVP_sha256(), nullptr) == 1, "SHA init"); }
++    ~Digest() { EVP_MD_CTX_free(p); }
++    void update(const void* data, size_t count) { need(EVP_DigestUpdate(p, data, count) == 1, "SHA update"); }
++    std::string finish() {
++        unsigned char bytes[EVP_MAX_MD_SIZE]; unsigned count = 0;
++        need(EVP_DigestFinal_ex(p, bytes, &count) == 1 && count == 32, "SHA final");
++        std::ostringstream out;
++        for (unsigned i = 0; i < count; ++i) out << std::hex << std::setfill('0') << std::setw(2) << unsigned(bytes[i]);
++        return out.str();
++    }
++};
++bool digest_string(const std::string& value) {
++    return value.size() == 64 && value.find_first_not_of("0123456789abcdef") == std::string::npos;
++}
++void sync_directory(const fs::path& path) {
++    int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
++    need(fd >= 0, "open directory for sync");
++    int result = ::fsync(fd); ::close(fd); need(result == 0, "directory sync");
++}
++fs::path temporary(const fs::path& dir, const std::string& name) {
++    std::string value = (dir / (".tmp-" + name + "-XXXXXX")).string();
++    std::vector<char> chars(value.begin(), value.end()); chars.push_back(0);
++    int fd = ::mkstemp(chars.data()); need(fd >= 0, "create temporary"); ::close(fd);
++    return chars.data();
++}
++void sync_file(const fs::path& path) {
++    int fd = ::open(path.c_str(), O_RDONLY); need(fd >= 0, "open artifact for sync");
++    int result = ::fsync(fd); ::close(fd); need(result == 0, "artifact sync");
++}
++void publish_exclusive(const fs::path& temp, const fs::path& destination) {
++    sync_file(temp);
++    need(::link(temp.c_str(), destination.c_str()) == 0, "refusing existing artifact " + destination.string());
++    sync_directory(destination.parent_path());
++    need(::unlink(temp.c_str()) == 0, "release own temporary link");
++}
++void retain_orphan(const fs::path& path) {
++    if (!fs::exists(path)) return;
++    need(fs::is_regular_file(fs::symlink_status(path)), "uncommitted artifact is not regular");
++    for (size_t i = 0;; ++i) {
++        auto orphan = path.parent_path() / ("orphan-" + path.filename().string() + "-" + std::to_string(::getpid()) + "-" + std::to_string(i));
++        if (::link(path.c_str(), orphan.c_str()) == 0) {
++            sync_directory(path.parent_path()); need(::unlink(path.c_str()) == 0, "retain orphan"); return;
++        }
++        need(errno == EEXIST, "orphan publication failed");
++    }
++}
++void write_bytes(const fs::path& path, const void* bytes, size_t size) {
++    std::ofstream out(path, std::ios::binary | std::ios::trunc);
++    need(bool(out), "open artifact output"); out.write(static_cast<const char*>(bytes), size);
++    out.flush(); need(bool(out), "write artifact output"); out.close(); need(bool(out), "close artifact output");
++}
++void read_bytes(const fs::path& path, void* bytes, size_t size) {
++    need(fs::is_regular_file(fs::symlink_status(path)) && fs::file_size(path) == size, "artifact size/type mismatch " + path.string());
++    std::ifstream in(path, std::ios::binary); need(bool(in), "open artifact input");
++    in.read(static_cast<char*>(bytes), size); need(size == 0 || size_t(in.gcount()) == size, "short artifact input");
++}
++std::string concat_sha(const fs::path& root, const std::vector<std::pair<size_t,size_t>>& chunks) {
++    Digest hash; std::array<char,1 << 20> buffer;
++    for (auto [start,count] : chunks) {
++        auto path = root / "labels" / (std::to_string(start) + ".u32");
++        std::ifstream in(path, std::ios::binary); need(bool(in), "open labels for full SHA");
++        while (in) { in.read(buffer.data(), buffer.size()); auto n=in.gcount(); if(n>0) hash.update(buffer.data(), n); }
++        need(in.eof(), "read labels full SHA");
++    }
++    return hash.finish();
++}
++}
++std::string checkpoint_sha256(const void* bytes, size_t count) { Digest hash; hash.update(bytes,count); return hash.finish(); }
++std::string checkpoint_file_sha256(const fs::path& path) {
++    need(fs::is_regular_file(fs::symlink_status(path)), "artifact must be regular file");
++    Digest hash; std::array<char,1 << 20> buffer; std::ifstream in(path, std::ios::binary); need(bool(in), "open SHA input");
++    while (in) { in.read(buffer.data(), buffer.size()); auto n=in.gcount(); if(n>0) hash.update(buffer.data(), n); }
++    need(in.eof(), "read SHA input"); return hash.finish();
++}
++AssignmentCheckpoint::AssignmentCheckpoint(const std::string& directory, const AssignmentCheckpointConfig& config, bool resume)
++  : root_(fs::absolute(directory)), config_(config) {
++    need(digest_string(config.identity_sha256) && digest_string(config.doclens_sha256), "explicit identity/doclens SHA required");
++    need(config.tokens>0 && config.dimension>0 && config.clusters>0 && config.clusters<=config.tokens && config.ex_bits>=1 && config.ex_bits<=7 && config.clusters<=std::numeric_limits<uint32_t>::max() && config.batch_size==65536 && config.assignment_k==1 && config.assignment_itopk==150, "invalid assignment configuration");
++    need(config.dimension<=std::numeric_limits<size_t>::max()/sizeof(float)/config.clusters, "centroid size overflow");
++    need(!resume || fs::is_directory(root_), "resume cache does not exist");
++    bool created=resume ? false : fs::create_directory(root_);
++    if (created) sync_directory(root_.parent_path());
++    need(!fs::is_symlink(fs::symlink_status(root_)) && fs::is_directory(root_), "checkpoint directory required");
++    need(resume || created, "existing cache requires explicit resume");
++    try {
++        lock_fd_=::open((root_/".lock").c_str(), O_RDWR|O_CREAT|O_NOFOLLOW,0600);
++        need(lock_fd_>=0 && ::flock(lock_fd_,LOCK_EX|LOCK_NB)==0, "cache already locked");
++        if(resume) { need(!created && fs::exists(root_/"state.txt"), "resume requires committed state"); read_state(); validate(); }
++        else { fs::create_directory(root_/"labels"); write_state(); }
++    } catch(...) { if(lock_fd_>=0) ::close(lock_fd_); lock_fd_=-1; throw; }
++}
++AssignmentCheckpoint::~AssignmentCheckpoint() { if(lock_fd_>=0) ::close(lock_fd_); }
++bool AssignmentCheckpoint::has_centroids() const { return centroids_.sha!="-"; }
++bool AssignmentCheckpoint::has_graph() const { return graph_.sha!="-"; }
++fs::path AssignmentCheckpoint::chunk_path(size_t start) const { return root_/"labels"/(std::to_string(start)+".u32"); }
++void AssignmentCheckpoint::write_state() {
++    auto temp=temporary(root_,"state"); std::ofstream out(temp);
++    out << "CHIMERA_ASSIGNMENT_CHECKPOINT_V1\n" << config_.identity_sha256 << '\n' << config_.doclens_sha256 << '\n'
++        << config_.tokens << ' ' << config_.dimension << ' ' << config_.clusters << ' ' << config_.ex_bits << ' '
++        << config_.batch_size << ' ' << config_.sample_seed << ' ' << config_.rotator_seed << ' '
++        << config_.assignment_k << ' ' << config_.assignment_itopk << '\n'
++        << centroids_.bytes << ' ' << centroids_.sha << '\n' << graph_.bytes << ' ' << graph_.sha << '\n'
++        << done_ << ' ' << labels_sha_ << ' ' << chunks_.size() << '\n';
++    for(const auto& c:chunks_) out<<c.start<<' '<<c.count<<' '<<c.sha<<'\n';
++    out.flush(); need(bool(out),"state write"); out.close(); sync_file(temp);
++    need(::rename(temp.c_str(),(root_/"state.txt").c_str())==0,"atomic state publication"); sync_directory(root_);
++}
++void AssignmentCheckpoint::read_state() {
++    auto state=root_/"state.txt"; need(fs::is_regular_file(fs::symlink_status(state)) && fs::file_size(state)<16*1024*1024,"state type/size invalid");
++    std::ifstream in(state); std::string magic, identity, doclens; AssignmentCheckpointConfig actual; size_t count=0;
++    in>>magic>>identity>>doclens>>actual.tokens>>actual.dimension>>actual.clusters>>actual.ex_bits>>actual.batch_size>>actual.sample_seed>>actual.rotator_seed>>actual.assignment_k>>actual.assignment_itopk;
++    need(bool(in) && magic=="CHIMERA_ASSIGNMENT_CHECKPOINT_V1" && identity==config_.identity_sha256 && doclens==config_.doclens_sha256,"state identity/schema mismatch");
++    need(actual.tokens==config_.tokens && actual.dimension==config_.dimension && actual.clusters==config_.clusters && actual.ex_bits==config_.ex_bits && actual.batch_size==config_.batch_size && actual.sample_seed==config_.sample_seed && actual.rotator_seed==config_.rotator_seed && actual.assignment_k==config_.assignment_k && actual.assignment_itopk==config_.assignment_itopk,"state parameter mismatch");
++    in>>centroids_.bytes>>centroids_.sha>>graph_.bytes>>graph_.sha>>done_>>labels_sha_>>count;
++    need(bool(in) && count<=1+(config_.tokens-1)/config_.batch_size,"state prefix count invalid");
++    for(size_t i=0;i<count;i++) { Chunk c; in>>c.start>>c.count>>c.sha; need(bool(in),"truncated state"); chunks_.push_back(c); }
++    std::string extra; need(!(in>>extra),"unexpected state fields");
++}
++void AssignmentCheckpoint::validate() const {
++    need(done_<=config_.tokens && (has_centroids() || (!has_graph() && done_==0 && chunks_.empty())),"invalid checkpoint stage");
++    if(has_centroids()) need(digest_string(centroids_.sha) && centroids_.bytes==config_.clusters*config_.dimension*sizeof(float) && fs::file_size(root_/"centroids.f32")==centroids_.bytes && checkpoint_file_sha256(root_/"centroids.f32")==centroids_.sha,"centroid checksum mismatch");
++    else need(centroids_.bytes==0,"unexpected centroid bytes");
++    if(has_graph()) need(digest_string(graph_.sha) && graph_.bytes>0 && fs::file_size(root_/"assignment.cagra")==graph_.bytes && checkpoint_file_sha256(root_/"assignment.cagra")==graph_.sha,"graph checksum mismatch");
++    else need(graph_.bytes==0 && done_==0 && chunks_.empty(),"labels without committed graph");
++    size_t cursor=0; std::vector<std::pair<size_t,size_t>> paths;
++    for(const auto& c:chunks_) {
++        need(c.start==cursor && c.count==std::min(config_.batch_size,config_.tokens-cursor) && digest_string(c.sha),"noncontiguous labels");
++        std::vector<uint32_t> labels(c.count);read_bytes(chunk_path(c.start),labels.data(),labels.size()*sizeof(uint32_t));
++        need(checkpoint_sha256(labels.data(),labels.size()*sizeof(uint32_t))==c.sha,"label checksum mismatch");
++        for(auto label:labels) need(label<config_.clusters,"label outside centroid range");
++        cursor+=c.count;paths.emplace_back(c.start,c.count);
++    }
++    need(cursor==done_,"prefix completion mismatch");
++    if(done_==config_.tokens) need(digest_string(labels_sha_) && concat_sha(root_,paths)==labels_sha_,"full assignment checksum mismatch");
++    else need(labels_sha_=="-","premature full assignment digest");
++}
++std::vector<float> AssignmentCheckpoint::load_centroids() const {
++    need(has_centroids(),"centroids not committed"); std::vector<float> out(config_.clusters*config_.dimension);
++    read_bytes(root_/"centroids.f32",out.data(),out.size()*sizeof(float));
++    need(checkpoint_sha256(out.data(),out.size()*sizeof(float))==centroids_.sha,"centroids changed during load");return out;
++}
++void AssignmentCheckpoint::save_centroids(const std::vector<float>& values) {
++    need(!has_centroids() && !has_graph() && done_==0 && values.size()==config_.clusters*config_.dimension,"invalid centroid publication");
++    retain_orphan(root_/"centroids.f32");auto temp=temporary(root_,"centroids");write_bytes(temp,values.data(),values.size()*sizeof(float));publish_exclusive(temp,root_/"centroids.f32");
++    centroids_={values.size()*sizeof(float),checkpoint_sha256(values.data(),values.size()*sizeof(float))};write_state();
++}
++fs::path AssignmentCheckpoint::reserve_graph_temporary() { need(has_centroids() && !has_graph(),"graph stage invalid");return temporary(root_,"graph"); }
++void AssignmentCheckpoint::commit_graph(const fs::path& temp) {
++    need(has_centroids() && !has_graph() && temp.parent_path()==root_,"graph temporary outside cache");
++    Artifact artifact{fs::file_size(temp),checkpoint_file_sha256(temp)};need(artifact.bytes>0,"empty graph");retain_orphan(root_/"assignment.cagra");publish_exclusive(temp,root_/"assignment.cagra");graph_=artifact;write_state();
++}
++std::string AssignmentCheckpoint::graph_path() const { need(has_graph(),"graph not committed");return (root_/"assignment.cagra").string(); }
++void AssignmentCheckpoint::load_labels(std::vector<uint32_t>& values) const {
++    need(values.size()==config_.tokens,"assignment vector size mismatch");
++    for(const auto& c:chunks_) {auto* dest=values.data()+c.start;read_bytes(chunk_path(c.start),dest,c.count*sizeof(uint32_t));need(checkpoint_sha256(dest,c.count*sizeof(uint32_t))==c.sha,"labels changed during load");}
++}
++void AssignmentCheckpoint::append_labels(size_t start,const uint32_t* labels,size_t count) {
++    need(has_graph() && start==done_ && count>0 && count==std::min(config_.batch_size,config_.tokens-start),"assignment batch mismatch");
++    for(size_t i=0;i<count;i++) need(labels[i]<config_.clusters,"invalid assignment label");
++    auto destination=chunk_path(start);retain_orphan(destination);auto temp=temporary(root_/"labels","labels");write_bytes(temp,labels,count*sizeof(uint32_t));publish_exclusive(temp,destination);
++    chunks_.push_back({start,count,checkpoint_sha256(labels,count*sizeof(uint32_t))});done_+=count;
++    if(done_==config_.tokens) {std::vector<std::pair<size_t,size_t>> paths;for(auto& c:chunks_)paths.emplace_back(c.start,c.count);labels_sha_=concat_sha(root_,paths);}
++    write_state();
++}
++}  // namespace Chimera
+--- a/cpp/src/build_index.cu
++++ b/cpp/src/build_index.cu
+@@ -1,4 +1,7 @@
+ #include "chimera/spilled_full_codes.hpp"
++#include "chimera/build_checkpoint.hpp"
++#include <iostream>
++#include <chrono>
+ #include <cuda_runtime.h>
+ #include <thrust/device_vector.h>
+ 
+@@ -197,10 +200,31 @@
+     size_t num_embeddings,
+     size_t dimension,
+     const std::vector<float>& centroids,
+-    size_t n_clusters) {
++    size_t n_clusters,
++    AssignmentCheckpoint* checkpoint = nullptr,
++    size_t stop_after_batches = 0) {
+     PG_CAGRA assignment_index(n_clusters, dimension);
+-    assignment_index.build_index(centroids.data());
+-
++    if (checkpoint && checkpoint->has_graph()) {
++        std::cerr << "[BUILD_CHECKPOINT] assignment_graph_load_start" << std::endl;
++        assignment_index.load(checkpoint->graph_path());
++        std::cerr << "[BUILD_CHECKPOINT] assignment_graph_loaded" << std::endl;
++    } else {
++        if (checkpoint) std::cerr << "[BUILD_CHECKPOINT] assignment_graph_build_start" << std::endl;
++        assignment_index.build_index(centroids.data());
++        if (checkpoint) {
++            auto temporary = checkpoint->reserve_graph_temporary();
++            assignment_index.save(temporary.string());
++            check_cuda(cudaDeviceSynchronize(), "Completing checkpoint graph serialization");
++            checkpoint->commit_graph(temporary);
++            std::cerr << "[BUILD_CHECKPOINT] assignment_graph_committed" << std::endl;
++        }
++    }
++
++    if (checkpoint && (assignment_index.index_cagra->size() != n_clusters ||
++                       assignment_index.index_cagra->dim() != dimension ||
++                       assignment_index.index_cagra->graph_degree() != 64)) {
++        throw std::runtime_error("Checkpoint graph shape/default-degree mismatch");
++    }
+     const size_t batch_capacity = std::min(num_embeddings, kAssignmentBatchSize);
+     DeviceBuffer<float> device_embeddings(
+         checked_product(batch_capacity, dimension, "assignment batch"));
+@@ -211,7 +235,13 @@
+     std::vector<float> expanded_batch;
+     if (embeddings.is_fp16()) expanded_batch.resize(batch_capacity * dimension);
+     std::vector<uint32_t> assignments(num_embeddings);
+-    for (size_t start = 0; start < num_embeddings; start += batch_capacity) {
++    if (checkpoint) checkpoint->load_labels(assignments);
++    const size_t first = checkpoint ? checkpoint->completed_tokens() : 0;
++    size_t new_batches = 0;
++    const auto assignment_started = std::chrono::steady_clock::now();
++    if (checkpoint) std::cerr << "[BUILD_CHECKPOINT] assignment_start completed_tokens=" << first
++                              << " total_tokens=" << num_embeddings << " batch_size=" << batch_capacity << std::endl;
++    for (size_t start = first; start < num_embeddings; start += batch_capacity) {
+         const size_t count = std::min(batch_capacity, num_embeddings - start);
+         const float* source = nullptr;
+         if (embeddings.is_fp16()) {
+@@ -243,7 +273,15 @@
+                 count * sizeof(uint32_t),
+                 cudaMemcpyDeviceToHost),
+             "Copying centroid assignments to the host");
+-
++        if (checkpoint) {
++            checkpoint->append_labels(start, assignments.data() + start, count);
++            ++new_batches;
++            std::cerr << "[BUILD_CHECKPOINT] assignment_committed completed_tokens=" << start + count
++                      << " total_tokens=" << num_embeddings << " new_batches=" << new_batches
++                      << " elapsed_s=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - assignment_started).count()
++                      << std::endl;
++            if (stop_after_batches && new_batches >= stop_after_batches) throw BuildCheckpointStop{};
++        }
+     }
+     return assignments;
+ }
+@@ -504,6 +542,13 @@
+     const SearchOptions& options,
+     const BuildOptions& build_options) {
+     validate_search_options(options);
++    if (build_options.checkpoint_dir.empty() != build_options.checkpoint_identity_sha256.empty()) {
++        throw std::invalid_argument("Checkpoint directory and explicit identity SHA must be supplied together");
++    }
++    if (build_options.checkpoint_dir.empty() &&
++        (build_options.resume_checkpoint || build_options.stop_after_assignment_batches)) {
++        throw std::invalid_argument("Checkpoint stop/resume requires a checkpoint directory");
++    }
+     const size_t num_embeddings = validate_build_inputs(
+         embeddings,
+         dimension,
+@@ -525,17 +570,33 @@
+     this->ex_bits = ex_bits;
+     doc_lens_ = doc_lens;
+ 
+-    auto centroids = sample_centroids(
+-        embeddings,
+-        num_embeddings,
+-        dimension,
+-        n_clusters);
+-    auto assignments = assign_embeddings(
+-        embeddings,
+-        num_embeddings,
+-        dimension,
+-        centroids,
+-        n_clusters);
++    std::unique_ptr<AssignmentCheckpoint> checkpoint;
++    if (!build_options.checkpoint_dir.empty()) {
++        AssignmentCheckpointConfig config;
++        config.identity_sha256 = build_options.checkpoint_identity_sha256;
++        config.doclens_sha256 = checkpoint_sha256(doc_lens.data(), doc_lens.size() * sizeof(int));
++        config.tokens = num_embeddings; config.dimension = dimension;
++        config.clusters = n_clusters; config.ex_bits = ex_bits;
++        config.sample_seed = kCentroidSampleSeed; config.rotator_seed = kRotatorSeed;
++        checkpoint = std::make_unique<AssignmentCheckpoint>(build_options.checkpoint_dir, config, build_options.resume_checkpoint);
++    } else if (build_options.resume_checkpoint || build_options.stop_after_assignment_batches) {
++        throw std::invalid_argument("Checkpoint stop/resume requires a checkpoint directory");
++    }
++    std::vector<float> centroids;
++    if (checkpoint && checkpoint->has_centroids()) {
++        centroids = checkpoint->load_centroids();
++        std::cerr << "[BUILD_CHECKPOINT] sampled_centroids_loaded" << std::endl;
++    } else {
++        if (checkpoint) std::cerr << "[BUILD_CHECKPOINT] centroid_sample_start" << std::endl;
++        centroids = sample_centroids(embeddings, num_embeddings, dimension, n_clusters);
++        if (checkpoint) {
++            checkpoint->save_centroids(centroids);
++            std::cerr << "[BUILD_CHECKPOINT] sampled_centroids_committed" << std::endl;
++        }
++    }
++    auto assignments = assign_embeddings(embeddings, num_embeddings, dimension, centroids,
++                                         n_clusters, checkpoint.get(), build_options.stop_after_assignment_batches);
++    if (checkpoint) std::cerr << "[BUILD_CHECKPOINT] assignment_complete" << std::endl;
+     auto rotator = std::unique_ptr<Rotator<float>>(
+         choose_rotator_with_seed<float>(
+             dimension,
+@@ -549,7 +610,9 @@
+         dimension,
+         *rotator);
+     auto centroid_graph = std::make_unique<PG_CAGRA>(n_clusters, PADDED_DIM);
++    if (checkpoint) std::cerr << "[BUILD_CHECKPOINT] rotated_graph_build_start" << std::endl;
+     centroid_graph->build_index(rotated_centroids.data());
++    if (checkpoint) std::cerr << "[BUILD_CHECKPOINT] rotated_graph_complete" << std::endl;
+ 
+     ivf = new IVF_PG(n_clusters, dimension);
+     delete ivf->pg_index;
+@@ -559,6 +622,7 @@
+     release_vector(centroids);
+     release_vector(rotated_centroids);
+ 
++    if (checkpoint) std::cerr << "[BUILD_CHECKPOINT] encoding_start" << std::endl;
+     auto encoded = encode_embeddings(
+         embeddings,
+         num_embeddings,
+@@ -578,6 +642,7 @@
+     clustered_data_ = std::move(clustered);
+ 
+     has_index_ = true;
++    if (checkpoint) std::cerr << "[BUILD_CHECKPOINT] index_ready_for_save" << std::endl;
+ }
+ 
+ void chimera_index::save(const std::string& index_dir) const {

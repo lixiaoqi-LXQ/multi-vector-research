@@ -1,0 +1,460 @@
+--- a/cpp/apps/search.cpp
++++ b/cpp/apps/search.cpp
+@@ -90,7 +90,10 @@
+         ground_truth.begin(), ground_truth.begin() + run_queries);
+ 
+     chimera_index index;
+-    index.load(args.index_dir, args.options);
++    index.load(args.index_dir, args.options, args.load_options);
++    std::cout << "[LOAD] low_memory=" << args.load_options.low_memory
++              << " prefault_full_codes=" << args.load_options.prefault_full_codes
++              << " transfer_chunk_bytes=" << args.load_options.transfer_chunk_bytes << '\n';
+     index.set_capture_scores(!args.output_file.empty());
+ 
+     for (int i = 0; i < warmup_queries; ++i) {
+--- a/cpp/apps/utils.cpp
++++ b/cpp/apps/utils.cpp
+@@ -98,7 +98,9 @@
+         if (arg == "--help" || arg == "-h") {
+             throw HelpRequested {};
+         }
+-        if (arg == "--output") {
++        if (arg == "--low-memory") {
++            args.load_options.low_memory = true;
++        } else if (arg == "--output") {
+             args.output_file = require_value(argc, argv, i, arg);
+         } else if (arg == "--query" || arg == "-q") {
+             args.query_file = require_value(argc, argv, i, arg);
+@@ -172,6 +174,7 @@
+         << "  --query <query_embeddings.bin>\n"
+         << "  --gt <groundtruth.tsv>\n"
+         << "  --index <index_dir>\n"
++        << "  [--low-memory]                 Read-only CPU full-code mmap and bounded clustered upload; save disabled.\n"
+         << "  [--output <results.tsv>]        Write query/rank/doc/quantized_score/latency after measurement.\n"
+         << "  [--k <top_k>]                   Final documents returned. Default: "
+         << defaults.k << "\n"
+--- a/cpp/apps/utils.hpp
++++ b/cpp/apps/utils.hpp
+@@ -28,6 +28,7 @@
+     std::string gt_file;
+     std::string index_dir;
+     SearchOptions options;
++    LoadOptions load_options;
+ };
+ 
+ struct QueryLatencySummary {
+--- a/cpp/include/chimera/chimera_index.cuh
++++ b/cpp/include/chimera/chimera_index.cuh
+@@ -22,6 +22,14 @@
+ namespace Chimera {
+ 
+ struct IVF_PG;
++class ReadOnlyMappedFile;
++
++struct LoadOptions {
++    bool low_memory = false;
++    size_t transfer_chunk_bytes = 64ull * 1024ull * 1024ull;
++    // True reads mapped CPU pages once during load, before query timing.
++    bool prefault_full_codes = true;
++};
+ 
+ struct SearchOptions {
+     int nprobe = 128;
+@@ -80,6 +88,10 @@
+     void load(
+         const std::string& index_dir,
+         const SearchOptions& options = {});
++    void load(
++        const std::string& index_dir,
++        const SearchOptions& options,
++        const LoadOptions& load_options);
+ 
+     chimera_index(const chimera_index&) = delete;
+     chimera_index& operator=(const chimera_index&) = delete;
+@@ -146,6 +158,11 @@
+     rabitqlib::Rotator<float>* rotator_ = nullptr;
+     IVF_PG* ivf = nullptr;
+     std::vector<char> full_bit_codes_;
++    std::unique_ptr<ReadOnlyMappedFile> mapped_full_bit_codes_;
++    const char* mapped_full_bit_data_ = nullptr;
++    LoadOptions load_options_;
++    bool low_memory_load_ = false;
++    std::string load_directory_;
+     std::vector<float> full_bit_factors_;
+     std::vector<std::uint64_t> one_bit_codes_;
+     std::vector<float> one_bit_factors_;
+--- a/cpp/src/build_index.cu
++++ b/cpp/src/build_index.cu
+@@ -23,6 +23,7 @@
+ #include <vector>
+ 
+ #include "chimera/config.cuh"
++#include "chimera/index_file_io.hpp"
+ #include "chimera/ivf_pg.hpp"
+ #include "chimera/quantization.hpp"
+ #include "rabitqlib/utils/rotator.hpp"
+@@ -497,6 +498,8 @@
+ }
+ 
+ void chimera_index::save(const std::string& index_dir) const {
++    // Reject before prepare_output_directory can remove existing payloads.
++    reject_readonly_index_save(low_memory_load_);
+     if (!has_index_) {
+         throw std::runtime_error("Cannot save an empty Chimera index");
+     }
+--- a/cpp/src/chimera_index.cu
++++ b/cpp/src/chimera_index.cu
+@@ -6,6 +6,7 @@
+ 
+ #include "chimera/config.cuh"
+ #include "chimera/io.hpp"
++#include "chimera/index_file_io.hpp"
+ #include "chimera/ivf_pg.hpp"
+ #include "chimera/quantization.hpp"
+ #include "chimera_index_internal.cuh"
+@@ -55,7 +56,17 @@
+ void chimera_index::load(
+     const std::string& index_dir,
+     const SearchOptions& options) {
++    load(index_dir, options, LoadOptions {});
++}
++
++void chimera_index::load(
++    const std::string& index_dir,
++    const SearchOptions& options,
++    const LoadOptions& load_options) {
+     validate_search_options(options);
++    if (load_options.transfer_chunk_bytes == 0) {
++        throw std::invalid_argument("Load transfer_chunk_bytes must be positive");
++    }
+     const std::filesystem::path directory(index_dir);
+     if (!std::filesystem::is_directory(directory)) {
+         throw std::runtime_error(
+@@ -69,6 +80,18 @@
+     }
+     check_cuda(cudaSetDevice(0), "Selecting CUDA device 0");
+     begin_initialization(options);
++    load_options_ = load_options;
++    low_memory_load_ = load_options.low_memory;
++    load_directory_ = std::filesystem::absolute(directory).string();
++    if (low_memory_load_) {
++        // release_resources clears vector sizes; drop capacities from a previous
++        // ordinary load too so switching modes on the same object saves memory.
++        std::vector<char>().swap(full_bit_codes_);
++        std::vector<uint64_t>().swap(one_bit_codes_);
++        std::vector<float>().swap(one_bit_factors_);
++        std::vector<char>().swap(clustered_data_);
++        std::vector<float>().swap(full_bit_factors_);
++    }
+ 
+     const auto doclens_path = (directory / "doclens.bin").string();
+     const auto doc_one_bit_path = (directory / "doc_1bit.bin").string();
+@@ -117,29 +140,38 @@
+         throw std::runtime_error("Failed to read rotator from " + doc_one_bit_path);
+     }
+ 
+-    one_bit_codes_.resize(n * (PADDED_DIM / 64));
+-    one_bit_factors_.resize(n);
+-    full_bit_codes_.resize(n * PADDED_DIM * (1 + ex_bits) / 8);
+     full_bit_factors_.resize(n);
+-
+-    inf.read(
+-        reinterpret_cast<char*>(one_bit_codes_.data()),
+-        static_cast<std::streamsize>(one_bit_codes_.size() * sizeof(uint64_t)));
+-    inf.read(
+-        reinterpret_cast<char*>(one_bit_factors_.data()),
+-        static_cast<std::streamsize>(one_bit_factors_.size() * sizeof(float)));
+-    inf.read(
+-        reinterpret_cast<char*>(full_bit_factors_.data()),
+-        static_cast<std::streamsize>(full_bit_factors_.size() * sizeof(float)));
++    if (low_memory_load_) {
++        // doc_1bit.bin after its rotator stores codes[16*N], one-bit
++        // factors[4*N], then CPU full-bit factors[4*N]. Search uses only
++        // the last segment on CPU; GPU 1-bit data comes from cluster_1bit.bin.
++        const size_t skip = n * (PADDED_DIM / 8 + sizeof(float));
++        inf.seekg(static_cast<std::streamoff>(skip), std::ios::cur);
++    } else {
++        one_bit_codes_.resize(n * (PADDED_DIM / 64));
++        one_bit_factors_.resize(n);
++        inf.read(reinterpret_cast<char*>(one_bit_codes_.data()),
++                 static_cast<std::streamsize>(one_bit_codes_.size() * sizeof(uint64_t)));
++        inf.read(reinterpret_cast<char*>(one_bit_factors_.data()),
++                 static_cast<std::streamsize>(one_bit_factors_.size() * sizeof(float)));
++    }
++    inf.read(reinterpret_cast<char*>(full_bit_factors_.data()),
++             static_cast<std::streamsize>(full_bit_factors_.size() * sizeof(float)));
+     if (!inf) {
+-        throw std::runtime_error(
+-            "Failed to read quantized payload from " + doc_one_bit_path);
+-    }
+-    std::ifstream full_bit_codes_file(doc_full_path, std::ios::binary);
+-    full_bit_codes_file.read(full_bit_codes_.data(), full_bit_codes_.size());
+-    if (!full_bit_codes_file) {
+-        throw std::runtime_error(
+-            "Failed to read full-code payload from " + doc_full_path);
++        throw std::runtime_error("Failed to read quantized payload from " + doc_one_bit_path);
++    }
++    const size_t full_code_bytes = n * PADDED_DIM * (1 + ex_bits) / 8;
++    if (low_memory_load_) {
++        mapped_full_bit_codes_ = std::make_unique<ReadOnlyMappedFile>(doc_full_path, full_code_bytes);
++        mapped_full_bit_data_ = mapped_full_bit_codes_->data();
++        if (load_options_.prefault_full_codes) mapped_full_bit_codes_->prefault();
++    } else {
++        full_bit_codes_.resize(full_code_bytes);
++        std::ifstream full_bit_codes_file(doc_full_path, std::ios::binary);
++        full_bit_codes_file.read(full_bit_codes_.data(), full_bit_codes_.size());
++        if (!full_bit_codes_file) {
++            throw std::runtime_error("Failed to read full-code payload from " + doc_full_path);
++        }
+     }
+     ivf = new IVF_PG(n_clusters, d);
+     ivf->load(ivf_path, centroids_path);
+@@ -155,14 +187,14 @@
+         throw std::runtime_error(
+             "Invalid clustered index payload: " + cluster_one_bit_path);
+     }
+-    clustered_data_.resize(clustered_bytes);
+-    clustered_file.seekg(0);
+-    clustered_file.read(
+-        clustered_data_.data(),
+-        static_cast<std::streamsize>(clustered_data_.size()));
+-    if (!clustered_file) {
+-        throw std::runtime_error(
+-            "Failed to read clustered index: " + cluster_one_bit_path);
++    if (!low_memory_load_) {
++        clustered_data_.resize(clustered_bytes);
++        clustered_file.seekg(0);
++        clustered_file.read(clustered_data_.data(),
++                            static_cast<std::streamsize>(clustered_data_.size()));
++        if (!clustered_file) {
++            throw std::runtime_error("Failed to read clustered index: " + cluster_one_bit_path);
++        }
+     }
+ 
+     has_index_ = true;
+@@ -205,44 +237,56 @@
+     const size_t code_per_vec = PADDED_DIM / 8;
+     const size_t expected_clustered_bytes =
+         n * (code_per_vec + sizeof(float) + sizeof(int) + sizeof(uint32_t));
+-    if (clustered_data_.size() != expected_clustered_bytes) {
++    if (!low_memory_load_ && clustered_data_.size() != expected_clustered_bytes) {
+         throw std::runtime_error("Invalid in-memory clustered index payload");
+     }
+ 
+     size_t free_mem = 0;
+     [[maybe_unused]] size_t total_mem = 0;
+     check_cuda(cudaMemGetInfo(&free_mem, &total_mem));
+-    if (free_mem <= clustered_data_.size()) {
++    if (free_mem <= expected_clustered_bytes) {
+         throw std::runtime_error(
+             "Insufficient GPU memory for clustered index: need " +
+-            std::to_string(clustered_data_.size()) + " bytes, have " +
++            std::to_string(expected_clustered_bytes) + " bytes, have " +
+             std::to_string(free_mem) + " bytes free");
+     }
+-
+-    const char* clustered_code = clustered_data_.data();
+-    const auto* clustered_factor = reinterpret_cast<const float*>(
+-        clustered_code + n * code_per_vec);
+-    const auto* clustered_doc_ids = reinterpret_cast<const int*>(
+-        reinterpret_cast<const char*>(clustered_factor) + n * sizeof(float));
+-    const auto* token_to_cluster_pos = reinterpret_cast<const uint32_t*>(
+-        reinterpret_cast<const char*>(clustered_doc_ids) + n * sizeof(int));
+ 
+     check_cuda(cudaMalloc(&d_clustered_one_bit_codes_, n * code_per_vec));
+     check_cuda(cudaMalloc(&d_clustered_one_bit_factors_, n * sizeof(float)));
+     check_cuda(cudaMalloc(&d_clustered_doc_ids_, n * sizeof(int)));
+     check_cuda(cudaMalloc(&d_token_to_cluster_pos_, n * sizeof(uint32_t)));
+-    check_cuda(cudaMemcpy(
+-        d_clustered_one_bit_codes_, clustered_code,
+-        n * code_per_vec, cudaMemcpyHostToDevice));
+-    check_cuda(cudaMemcpy(
+-        d_clustered_one_bit_factors_, clustered_factor,
+-        n * sizeof(float), cudaMemcpyHostToDevice));
+-    check_cuda(cudaMemcpy(
+-        d_clustered_doc_ids_, clustered_doc_ids,
+-        n * sizeof(int), cudaMemcpyHostToDevice));
+-    check_cuda(cudaMemcpy(
+-        d_token_to_cluster_pos_, token_to_cluster_pos,
+-        n * sizeof(uint32_t), cudaMemcpyHostToDevice));
++
++    if (low_memory_load_) {
++        const auto path = (std::filesystem::path(load_directory_) / "cluster_1bit.bin").string();
++        const std::vector<size_t> sizes = {
++            n * code_per_vec, n * sizeof(float), n * sizeof(int), n * sizeof(uint32_t)};
++        char* destinations[] = {
++            d_clustered_one_bit_codes_,
++            reinterpret_cast<char*>(d_clustered_one_bit_factors_),
++            reinterpret_cast<char*>(d_clustered_doc_ids_),
++            reinterpret_cast<char*>(d_token_to_cluster_pos_)};
++        stream_index_segments(path, sizes, load_options_.transfer_chunk_bytes,
++            [&](size_t segment, size_t offset, const char* data, size_t count) {
++                check_cuda(cudaMemcpy(destinations[segment] + offset, data, count,
++                                      cudaMemcpyHostToDevice));
++            });
++    } else {
++        const char* clustered_code = clustered_data_.data();
++        const auto* clustered_factor = reinterpret_cast<const float*>(
++            clustered_code + n * code_per_vec);
++        const auto* clustered_doc_ids = reinterpret_cast<const int*>(
++            reinterpret_cast<const char*>(clustered_factor) + n * sizeof(float));
++        const auto* token_to_cluster_pos = reinterpret_cast<const uint32_t*>(
++            reinterpret_cast<const char*>(clustered_doc_ids) + n * sizeof(int));
++        check_cuda(cudaMemcpy(d_clustered_one_bit_codes_, clustered_code,
++                              n * code_per_vec, cudaMemcpyHostToDevice));
++        check_cuda(cudaMemcpy(d_clustered_one_bit_factors_, clustered_factor,
++                              n * sizeof(float), cudaMemcpyHostToDevice));
++        check_cuda(cudaMemcpy(d_clustered_doc_ids_, clustered_doc_ids,
++                              n * sizeof(int), cudaMemcpyHostToDevice));
++        check_cuda(cudaMemcpy(d_token_to_cluster_pos_, token_to_cluster_pos,
++                              n * sizeof(uint32_t), cudaMemcpyHostToDevice));
++    }
+ 
+     compute_candidate_bounds();
+     allocate_workspace();
+--- a/cpp/src/cpu_scoring.cpp
++++ b/cpp/src/cpu_scoring.cpp
+@@ -14,7 +14,8 @@
+     std::pair<float, int>* full_bit_scores
+ ) {
+     const size_t full_bit_codes_stride = PADDED_DIM * (1 + ex_bits) / 8;
+-    const auto& full_bit_codes = full_bit_codes_;
++    const char* full_bit_codes = mapped_full_bit_data_ != nullptr
++        ? mapped_full_bit_data_ : full_bit_codes_.data();
+     const auto& full_bit_factors = full_bit_factors_;
+     alignas(64) float cbex_sumq_arr[Q_DOCLEN];
+     for (size_t j = 0; j < Q_DOCLEN; j++)
+--- a/cpp/src/utils.cu
++++ b/cpp/src/utils.cu
+@@ -11,6 +11,7 @@
+ #include "chimera/config.cuh"
+ #include "chimera/ivf_pg.hpp"
+ #include "chimera/kernels.cuh"
++#include "chimera/index_file_io.hpp"
+ #include "chimera_index_internal.cuh"
+ #include "rabitqlib/utils/rotator.hpp"
+ 
+@@ -532,6 +533,11 @@
+     d_clustered_doc_ids_ = nullptr;
+     d_token_to_cluster_pos_ = nullptr;
+ 
++    mapped_full_bit_data_ = nullptr;
++    mapped_full_bit_codes_.reset();
++    low_memory_load_ = false;
++    load_options_ = LoadOptions {};
++    load_directory_.clear();
+     full_bit_codes_.clear();
+     full_bit_factors_.clear();
+     one_bit_codes_.clear();
+--- /dev/null
++++ b/cpp/include/chimera/index_file_io.hpp
+@@ -0,0 +1,109 @@
++#pragma once
++
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <fstream>
++#include <limits>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace Chimera {
++
++// A raw, immutable index payload, not a CUDA-mapped allocation.
++class ReadOnlyMappedFile {
++ public:
++    ReadOnlyMappedFile(const std::string& path, size_t expected_bytes) {
++        struct Descriptor {
++            int value;
++            ~Descriptor() { if (value >= 0) (void)::close(value); }
++        } fd{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
++        if (fd.value < 0) fail("open", path);
++        struct stat state {};
++        if (::fstat(fd.value, &state) != 0) fail("fstat", path);
++        if (!S_ISREG(state.st_mode) || expected_bytes == 0 || state.st_size < 0 ||
++            static_cast<uintmax_t>(state.st_size) != static_cast<uintmax_t>(expected_bytes)) {
++            throw std::runtime_error("Index payload size/type mismatch: " + path);
++        }
++        bytes_ = expected_bytes;
++        mapping_ = ::mmap(nullptr, bytes_, PROT_READ, MAP_PRIVATE, fd.value, 0);
++        if (mapping_ == MAP_FAILED) fail("mmap", path);
++        // CPU random full-bit scoring reads ordinary file-backed pages.
++        (void)::madvise(mapping_, bytes_, MADV_RANDOM);
++    }
++    ~ReadOnlyMappedFile() {
++        if (mapping_ != MAP_FAILED) (void)::munmap(mapping_, bytes_);
++    }
++    ReadOnlyMappedFile(const ReadOnlyMappedFile&) = delete;
++    ReadOnlyMappedFile& operator=(const ReadOnlyMappedFile&) = delete;
++    const char* data() const { return static_cast<const char*>(mapping_); }
++    size_t size() const { return bytes_; }
++    // Match the original eager file read before query timing. Pages remain
++    // reclaimable; this is not mlock or guaranteed residency under memory pressure.
++    void prefault() const {
++        const long configured = ::sysconf(_SC_PAGESIZE);
++        const size_t page = configured > 0 ? static_cast<size_t>(configured) : 4096;
++        const volatile char* data = static_cast<const char*>(mapping_);
++        for (size_t offset = 0; offset < bytes_; offset += page) {
++            const char value = data[offset];
++            (void)value;
++        }
++    }
++ private:
++    [[noreturn]] static void fail(const char* operation, const std::string& path) {
++        const int error = errno;
++        throw std::runtime_error(std::string(operation) + " failed for " + path + ": " + std::strerror(error));
++    }
++    void* mapping_ = MAP_FAILED;
++    size_t bytes_ = 0;
++};
++
++inline void reject_readonly_index_save(bool low_memory_load) {
++    if (low_memory_load) {
++        throw std::logic_error("save() is unavailable after low-memory load; reload with default LoadOptions before saving");
++    }
++}
++
++// Read each serialized segment into a single bounded host buffer. consume receives
++// (segment index, segment-relative offset, bytes, count); it must finish reading
++// the buffer before returning. cudaMemcpy's synchronous H2D form satisfies this.
++template <typename Consumer>
++void stream_index_segments(const std::string& path,
++                           const std::vector<size_t>& segment_bytes,
++                           size_t buffer_bytes, Consumer consume) {
++    if (buffer_bytes == 0 || buffer_bytes > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
++        throw std::invalid_argument("Index streaming buffer size must be positive and fit streamsize");
++    }
++    size_t total = 0;
++    for (const size_t count : segment_bytes) {
++        if (count > std::numeric_limits<size_t>::max() - total) {
++            throw std::overflow_error("Index segment sizes overflow size_t");
++        }
++        total += count;
++    }
++    std::ifstream input(path, std::ios::binary | std::ios::ate);
++    if (!input || input.tellg() < 0 || static_cast<uintmax_t>(input.tellg()) != static_cast<uintmax_t>(total)) {
++        throw std::runtime_error("Clustered index payload size mismatch: " + path);
++    }
++    input.seekg(0);
++    std::vector<char> buffer(std::min(total, buffer_bytes));
++    for (size_t segment = 0; segment < segment_bytes.size(); ++segment) {
++        for (size_t offset = 0; offset < segment_bytes[segment];) {
++            const size_t count = std::min(buffer.size(), segment_bytes[segment] - offset);
++            input.read(buffer.data(), static_cast<std::streamsize>(count));
++            if (!input) throw std::runtime_error("Short clustered index read: " + path);
++            consume(segment, offset, buffer.data(), count);
++            offset += count;
++        }
++    }
++}
++
++}  // namespace Chimera

@@ -1,0 +1,15 @@
+--- a/cpp/src/search_impl.cu
++++ b/cpp/src/search_impl.cu
+@@ -275,7 +275,11 @@
+     std::vector<size_t>& result
+ ) {
+     ProfileRange range(profiling_enabled_, "Chimera/collaborative_scoring", num_refined_candidates);
+-    if (num_refined_candidates == 0) return;
++    if (num_refined_candidates == 0) {
++        result.clear();
++        last_result_scores_.clear();
++        return;
++    }
+ 
+     cudaStream_t stream = ws_->stream_compute;
+     cudaStream_t stream_d2h = ws_->stream_d2h;

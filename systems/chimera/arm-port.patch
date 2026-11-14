@@ -1,0 +1,2095 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -5,7 +5,7 @@
+ set(CMAKE_CUDA_STANDARD 17)
+ set(CMAKE_BUILD_TYPE Release)
+ 
+-add_compile_definitions(LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
++add_compile_definitions(LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE $<$<COMPILE_LANGUAGE:CUDA>:EIGEN_DONT_VECTORIZE>)
+ 
+ if(NOT CHIMERA_TOOLCHAIN_ROOT)
+     set(CHIMERA_TOOLCHAIN_ROOT "")
+@@ -34,10 +34,11 @@
+ endif()
+ 
+ add_compile_options(
+-    -fopenmp
+-    -march=native
+-    -ftree-vectorize
+-    -fexceptions
++    $<$<COMPILE_LANGUAGE:CXX>:-fopenmp>
++    $<$<COMPILE_LANGUAGE:CXX>:-march=native>
++    $<$<COMPILE_LANGUAGE:CXX>:-ftree-vectorize>
++    $<$<COMPILE_LANGUAGE:CXX>:-fexceptions>
++    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fopenmp,-march=native,-ftree-vectorize,-fexceptions>
+     $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=68,177,186>
+ )
+ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets -Wno-deprecated-declarations")
+@@ -53,9 +54,11 @@
+     cpp/src/build_index.cu
+     cpp/src/chimera_index.cu
+     cpp/src/io.cpp
++    cpp/src/fp16_input.cpp
+     cpp/src/ivf_pg.cpp
+     cpp/src/kernels.cu
+     cpp/src/quantization.cpp
++    cpp/src/cpu_scoring.cpp
+     cpp/src/search_impl.cu
+     cpp/src/utils.cu
+ )
+--- a/cpp/apps/build.cpp
++++ b/cpp/apps/build.cpp
+@@ -3,6 +3,9 @@
+ #include "chimera/io.hpp"
+ 
+ #include <iostream>
++#include "mapped_embeddings.hpp"
++#include "mapped_fp16_npy.hpp"
++#include <limits>
+ 
+ using namespace Chimera;
+ 
+@@ -20,16 +23,26 @@
+     }
+ 
+     auto doc_lens = load_doclens(args.doclens_file);
+-    size_t num_embeddings = 0;
+-    size_t dimension = 0;
+-    auto embeddings = load_data(num_embeddings, dimension, args.data_file);
+     chimera_index index;
+-    index.build(
+-        embeddings,
+-        dimension,
+-        doc_lens,
+-        args.n_clusters,
+-        args.ex_bits);
++    if (!args.fp16_npy_file.empty()) {
++        if (doc_lens.empty()) throw std::invalid_argument("Document lengths must not be empty");
++        size_t tokens = 0;
++        for (int length : doc_lens) {
++            if (length <= 0 || static_cast<size_t>(length) > std::numeric_limits<size_t>::max() - tokens) {
++                throw std::invalid_argument("Invalid or overflowing document lengths");
++            }
++            tokens += static_cast<size_t>(length);
++        }
++        MappedFp16Npy embeddings(args.fp16_npy_file, tokens);
++        std::cout << "[BUILD] input=FP16-NPY values=" << embeddings.size()
++                  << " dimension=" << embeddings.dimension() << '\n';
++        index.build_from_f16_ptr(embeddings.data(), embeddings.size(), embeddings.dimension(),
++                                 doc_lens, args.n_clusters, args.ex_bits);
++    } else {
++        MappedEmbeddings embeddings(args.data_file);
++        index.build_from_ptr(embeddings.data(), embeddings.size(), embeddings.dimension(),
++                             doc_lens, args.n_clusters, args.ex_bits);
++    }
+     index.save(args.index_dir);
+     return 0;
+ }
+--- a/cpp/apps/mapped_embeddings.hpp
++++ b/cpp/apps/mapped_embeddings.hpp
+@@ -0,0 +1,75 @@
++#pragma once
++
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++#include <string>
++
++// Same little-endian [int32 N, int32 D, float32 N*D] format as load_data.
++// The input must remain an immutable regular file until this object is destroyed.
++class MappedEmbeddings {
++ public:
++    explicit MappedEmbeddings(const std::string& path) {
++        static_assert(sizeof(float) == 4, "FP32 input requires four-byte floats");
++#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
++#error "MappedEmbeddings currently requires a little-endian host"
++#endif
++        struct FileDescriptor {
++            int value;
++            ~FileDescriptor() { if (value >= 0) (void)::close(value); }
++        } fd{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
++        if (fd.value < 0) fail("open", path);
++        struct stat state {};
++        if (::fstat(fd.value, &state) != 0) fail("fstat", path);
++        if (!S_ISREG(state.st_mode) || state.st_size < 8) {
++            throw std::runtime_error("Embedding input must be a regular file with an 8-byte header: " + path);
++        }
++        int32_t header[2];
++        if (::pread(fd.value, header, sizeof(header), 0) != sizeof(header)) {
++            throw std::runtime_error("Could not read complete embedding header: " + path);
++        }
++        if (header[0] <= 0 || header[1] <= 0) {
++            throw std::runtime_error("Embedding N and D must be positive: " + path);
++        }
++        dimension_ = static_cast<size_t>(header[1]);
++        const size_t rows = static_cast<size_t>(header[0]);
++        if (rows > (std::numeric_limits<size_t>::max() - 8) / sizeof(float) / dimension_) {
++            throw std::runtime_error("Embedding shape overflows host size_t: " + path);
++        }
++        values_ = rows * dimension_;
++        bytes_ = 8 + values_ * sizeof(float);
++        if (static_cast<uintmax_t>(state.st_size) != static_cast<uintmax_t>(bytes_)) {
++            throw std::runtime_error("Embedding file size disagrees with its N*D header: " + path);
++        }
++        mapping_ = ::mmap(nullptr, bytes_, PROT_READ, MAP_PRIVATE, fd.value, 0);
++        if (mapping_ == MAP_FAILED) fail("mmap", path);
++        // No anonymous corpus copy, mlock, or MAP_POPULATE: clean pages are reclaimable.
++        // Sequential advice allows the kernel to reclaim earlier pages during long scans.
++        (void)::madvise(mapping_, bytes_, MADV_SEQUENTIAL);
++    }
++    ~MappedEmbeddings() { if (mapping_ != MAP_FAILED) (void)::munmap(mapping_, bytes_); }
++    MappedEmbeddings(const MappedEmbeddings&) = delete;
++    MappedEmbeddings& operator=(const MappedEmbeddings&) = delete;
++    const float* data() const {
++        return reinterpret_cast<const float*>(static_cast<const char*>(mapping_) + 8);
++    }
++    size_t size() const { return values_; }
++    size_t dimension() const { return dimension_; }
++ private:
++    [[noreturn]] static void fail(const char* operation, const std::string& path) {
++        const int code = errno;
++        throw std::runtime_error(std::string(operation) + " failed for " + path + ": " + std::strerror(code));
++    }
++    void* mapping_ = MAP_FAILED;
++    size_t bytes_ = 0;
++    size_t values_ = 0;
++    size_t dimension_ = 0;
++};
+--- a/cpp/apps/mapped_fp16_npy.hpp
++++ b/cpp/apps/mapped_fp16_npy.hpp
+@@ -0,0 +1,105 @@
++#pragma once
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <cerrno>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <regex>
++#include <stdexcept>
++#include <string>
++
++// Read-only C-order NPY v1/v2, dtype <u2 raw FP16 bits or <f2, shape [N,D].
++// Optional token prefix maps only complete required rows, enabling .partial use.
++class MappedFp16Npy {
++ public:
++    explicit MappedFp16Npy(const std::string& path, size_t requested_rows = 0) {
++#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
++#error "MappedFp16Npy requires a little-endian host"
++#endif
++        struct Descriptor { int value; ~Descriptor() { if (value >= 0) (void)::close(value); } } fd{
++            ::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
++        if (fd.value < 0) fail("open", path);
++        struct stat state {};
++        if (::fstat(fd.value, &state) != 0) fail("fstat", path);
++        if (!S_ISREG(state.st_mode) || state.st_size < 12) {
++            throw std::runtime_error("NPY input must be a regular file: " + path);
++        }
++        uint8_t prefix[12];
++        read_at(fd.value, prefix, sizeof(prefix), 0, path);
++        const uint8_t magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y'};
++        if (std::memcmp(prefix, magic, sizeof(magic)) != 0 || prefix[7] != 0 ||
++            (prefix[6] != 1 && prefix[6] != 2)) {
++            throw std::runtime_error("Expected NPY format v1/v2: " + path);
++        }
++        size_t header_start = prefix[6] == 1 ? 10 : 12;
++        size_t header_bytes = static_cast<size_t>(prefix[8]) | (static_cast<size_t>(prefix[9]) << 8);
++        if (prefix[6] == 2) header_bytes |= (static_cast<size_t>(prefix[10]) << 16) | (static_cast<size_t>(prefix[11]) << 24);
++        if (header_bytes == 0 || header_bytes > 1024 * 1024 ||
++            header_start + header_bytes > static_cast<uintmax_t>(state.st_size)) {
++            throw std::runtime_error("Invalid/truncated NPY header: " + path);
++        }
++        std::string header(header_bytes, '\0');
++        read_at(fd.value, header.data(), header_bytes, static_cast<off_t>(header_start), path);
++        const std::regex dtype(R"re(["']descr["']\s*:\s*["']<(u2|f2)["'])re");
++        const std::regex order(R"re(["']fortran_order["']\s*:\s*False)re");
++        const std::regex shape(R"re(["']shape["']\s*:\s*\(\s*([0-9]+)\s*,\s*([0-9]+)\s*,?\s*\))re");
++        std::smatch match;
++        if (!std::regex_search(header, dtype) || !std::regex_search(header, order) ||
++            !std::regex_search(header, match, shape)) {
++            throw std::runtime_error("Expected C-order NPY <u2/<f2 matrix [N,D]: " + path);
++        }
++        const auto parsed_rows = std::stoull(match[1].str());
++        const auto parsed_dimension = std::stoull(match[2].str());
++        if (parsed_rows == 0 || parsed_dimension == 0 ||
++            parsed_rows > std::numeric_limits<size_t>::max() ||
++            parsed_dimension > std::numeric_limits<size_t>::max()) {
++            throw std::runtime_error("Invalid NPY matrix dimensions: " + path);
++        }
++        const size_t rows = static_cast<size_t>(parsed_rows);
++        dimension_ = static_cast<size_t>(parsed_dimension);
++        offset_ = header_start + header_bytes;
++        if (offset_ % alignof(uint16_t) != 0 ||
++            dimension_ > (std::numeric_limits<size_t>::max() - offset_) / sizeof(uint16_t) / rows) {
++            throw std::runtime_error("NPY matrix size/alignment invalid: " + path);
++        }
++        const size_t expected_bytes = offset_ + rows * dimension_ * sizeof(uint16_t);
++        const size_t mapped_rows = requested_rows == 0 ? rows : requested_rows;
++        if (mapped_rows > rows) throw std::runtime_error("Requested token prefix exceeds NPY matrix: " + path);
++        values_ = mapped_rows * dimension_;
++        bytes_ = offset_ + values_ * sizeof(uint16_t);
++        if (static_cast<uintmax_t>(state.st_size) > static_cast<uintmax_t>(expected_bytes) ||
++            static_cast<uintmax_t>(state.st_size) < static_cast<uintmax_t>(bytes_)) {
++            throw std::runtime_error("NPY file does not contain the requested complete prefix, or has trailing bytes: " + path);
++        }
++        mapping_ = ::mmap(nullptr, bytes_, PROT_READ, MAP_PRIVATE, fd.value, 0);
++        if (mapping_ == MAP_FAILED) fail("mmap", path);
++        (void)::madvise(mapping_, bytes_, MADV_SEQUENTIAL);
++    }
++    ~MappedFp16Npy() { if (mapping_ != MAP_FAILED) (void)::munmap(mapping_, bytes_); }
++    MappedFp16Npy(const MappedFp16Npy&) = delete;
++    MappedFp16Npy& operator=(const MappedFp16Npy&) = delete;
++    const uint16_t* data() const {
++        return reinterpret_cast<const uint16_t*>(static_cast<const char*>(mapping_) + offset_);
++    }
++    size_t size() const { return values_; }
++    size_t dimension() const { return dimension_; }
++ private:
++    static void read_at(int fd, void* buffer, size_t count, off_t offset, const std::string& path) {
++        if (::pread(fd, buffer, count, offset) != static_cast<ssize_t>(count)) {
++            throw std::runtime_error("Failed reading NPY header: " + path);
++        }
++    }
++    [[noreturn]] static void fail(const char* operation, const std::string& path) {
++        const int error = errno;
++        throw std::runtime_error(std::string(operation) + " failed for " + path + ": " + std::strerror(error));
++    }
++    void* mapping_ = MAP_FAILED;
++    size_t bytes_ = 0;
++    size_t values_ = 0;
++    size_t dimension_ = 0;
++    size_t offset_ = 0;
++};
+--- a/cpp/apps/search.cpp
++++ b/cpp/apps/search.cpp
+@@ -1,10 +1,20 @@
+ #include "utils.hpp"
+ #include "chimera/config.cuh"
++#include "chimera/profiling.hpp"
++#include <cuda_profiler_api.h>
++#include <omp.h>
++#include <sched.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#include <sstream>
+ #include "chimera/io.hpp"
+ 
+ #include <algorithm>
+ #include <chrono>
+ #include <iomanip>
++#include <fstream>
++#include <numeric>
++#include <stdexcept>
+ #include <iostream>
+ #include <string>
+ #include <vector>
+@@ -41,6 +51,31 @@
+               << " max=" << latency.max_ms
+               << " stddev=" << latency.stddev_ms
+               << '\n';
++}
++
++
++void report_thread_affinity() {
++#pragma omp parallel
++    {
++        cpu_set_t allowed;
++        CPU_ZERO(&allowed);
++        const int status = sched_getaffinity(0, sizeof(allowed), &allowed);
++        std::ostringstream line;
++        line << "[THREAD] omp_thread=" << omp_get_thread_num()
++             << " linux_tid=" << static_cast<long>(syscall(SYS_gettid))
++             << " cpu=" << sched_getcpu() << " allowed=";
++        bool first = true;
++        if (status == 0) for (int core = 0; core < CPU_SETSIZE; ++core) {
++            if (CPU_ISSET(core, &allowed)) {
++                if (!first) line << ',';
++                line << core;
++                first = false;
++            }
++        }
++        if (status != 0) line << "ERROR";
++#pragma omp critical
++        std::cout << line.str() << '\n';
++    }
+ }
+ 
+ }  // namespace
+@@ -83,19 +118,40 @@
+         return 1;
+     }
+ 
++    if (args.profile_range && run_queries != 32 && run_queries != 100) {
++        throw std::invalid_argument("--profile-range requires --nq 32 or --nq 100");
++    }
+     std::vector<std::vector<size_t>> eval_ground_truth(
+         ground_truth.begin(), ground_truth.begin() + run_queries);
+ 
+     chimera_index index;
+-    index.load(args.index_dir, args.options);
++    index.load(args.index_dir, args.options, args.load_options);
++    std::cout << "[LOAD] low_memory=" << args.load_options.low_memory
++              << " prefault_full_codes=" << args.load_options.prefault_full_codes
++              << " transfer_chunk_bytes=" << args.load_options.transfer_chunk_bytes << '\n';
++    index.set_capture_scores(!args.output_file.empty());
+ 
+     for (int i = 0; i < warmup_queries; ++i) {
+         index.search(&queries[i * Q_DOCLEN * d], Q_DOCLEN * d, args.k);
+     }
+ 
++    if (args.thread_info) report_thread_affinity();
+     std::vector<std::vector<size_t>> results(run_queries);
+     std::vector<double> query_latencies_ms(run_queries);
++    std::vector<std::vector<float>> scores(args.output_file.empty() ? 0 : run_queries);
++    {
++        size_t free_bytes = 0, total_bytes = 0;
++        check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "Querying CUDA memory view");
++        std::cout << "[MEMORY] phase=after_warmup cudaMemGetInfo_free_bytes=" << free_bytes
++                  << " cudaMemGetInfo_total_bytes=" << total_bytes << '\n';
++    }
++    if (args.profile_range) {
++        index.set_profiling_enabled(true);
++        check_cuda(cudaProfilerStart(), "Starting diagnostic capture");
++    }
++    const auto loop_start = std::chrono::steady_clock::now();
+     for (int i = 0; i < run_queries; ++i) {
++        ProfileRange query_range(args.profile_range, "Chimera/query_local_row", i);
+         const auto query_start = std::chrono::high_resolution_clock::now();
+         results[i] =
+             index.search(&queries[i * Q_DOCLEN * d], Q_DOCLEN * d, args.k);
+@@ -103,8 +159,35 @@
+         query_latencies_ms[i] =
+             std::chrono::duration<double, std::milli>(
+                 query_end - query_start).count();
++        if (!args.output_file.empty()) scores[i] = index.last_result_scores();
+     }
+ 
++    const double loop_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loop_start).count();
++    if (args.profile_range) {
++        check_cuda(cudaProfilerStop(), "Stopping diagnostic capture");
++        index.set_profiling_enabled(false);
++        std::cout << "[PROFILE] metric_scope=diagnostic_profile_not_QPS\n";
++    }
++    if (!args.output_file.empty()) {
++        std::ofstream output(args.output_file);
++        if (!output) throw std::runtime_error("Could not open result output: " + args.output_file);
++        output << "query_id\trank\tdocument_id\tquantized_score\tlatency_ms\n" << std::setprecision(10);
++        for (int i = 0; i < run_queries; ++i)
++            for (size_t j = 0; j < results[i].size(); ++j)
++                output << i << '\t' << j+1 << '\t' << results[i][j] << '\t'
++                       << scores[i][j] << '\t' << query_latencies_ms[i] << '\n';
++        if (!output) throw std::runtime_error("Failed writing result output");
++    }
++    {
++        size_t free_bytes = 0, total_bytes = 0;
++        check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "Querying CUDA memory view");
++        std::cout << "[MEMORY] phase=after_queries cudaMemGetInfo_free_bytes=" << free_bytes
++                  << " cudaMemGetInfo_total_bytes=" << total_bytes << '\n';
++    }
++    const double total_ms = std::accumulate(query_latencies_ms.begin(), query_latencies_ms.end(), 0.0);
++    std::cout << std::setprecision(10) << "[SEARCH] queries=" << run_queries
++              << " total_search_ms=" << total_ms << " qps=" << run_queries*1000.0/total_ms
++              << " loop_wall_ms=" << loop_ms << " loop_qps=" << run_queries*1000.0/loop_ms << '\n';
+     report_latency(query_latencies_ms);
+     report_recalls(eval_ground_truth, results, args.k);
+ 
+--- a/cpp/apps/utils.cpp
++++ b/cpp/apps/utils.cpp
+@@ -1,4 +1,5 @@
+ #include "utils.hpp"
++#include "chimera/config.cuh"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -30,6 +31,10 @@
+     if (options.nprobe <= 0) {
+         throw std::runtime_error("--nprobe must be > 0");
+     }
++    if (options.nprobe > kCandidateRefinementMaxNprobe) {
++        throw std::invalid_argument("nprobe must not exceed candidate refinement limit " +
++                                    std::to_string(kCandidateRefinementMaxNprobe));
++    }
+     if (options.k_refine <= 0) {
+         throw std::runtime_error("--k-refine must be > 0");
+     }
+@@ -66,6 +71,8 @@
+             args.doclens_file = require_value(argc, argv, i, arg);
+         } else if (arg == "--data") {
+             args.data_file = require_value(argc, argv, i, arg);
++        } else if (arg == "--fp16-npy") {
++            args.fp16_npy_file = require_value(argc, argv, i, arg);
+         } else if (arg == "--n-clusters") {
+             args.n_clusters = std::stoull(require_value(argc, argv, i, arg));
+         } else if (arg == "--ex-bits") {
+@@ -75,8 +82,11 @@
+         }
+     }
+ 
++    if (args.data_file.empty() == args.fp16_npy_file.empty()) {
++        throw std::runtime_error("Provide exactly one of --data (raw FP32) or --fp16-npy");
++    }
+     if (args.index_dir.empty() || args.doclens_file.empty() ||
+-        args.data_file.empty() || args.n_clusters == 0 || args.ex_bits == 0) {
++        args.n_clusters == 0 || args.ex_bits == 0) {
+         throw std::runtime_error("Missing required arguments.");
+     }
+     return args;
+@@ -93,7 +103,15 @@
+         if (arg == "--help" || arg == "-h") {
+             throw HelpRequested {};
+         }
+-        if (arg == "--query" || arg == "-q") {
++        if (arg == "--thread-info") {
++            args.thread_info = true;
++        } else if (arg == "--low-memory") {
++            args.load_options.low_memory = true;
++        } else if (arg == "--profile-range") {
++            args.profile_range = true;
++        } else if (arg == "--output") {
++            args.output_file = require_value(argc, argv, i, arg);
++        } else if (arg == "--query" || arg == "-q") {
+             args.query_file = require_value(argc, argv, i, arg);
+         } else if (arg == "--gt" || arg == "-g") {
+             args.gt_file = require_value(argc, argv, i, arg);
+@@ -148,12 +166,13 @@
+ void print_build_help(const char* program) {
+     std::cout
+         << "Usage: " << program
+-        << " --index <index_dir> --doclens <doclens> --data <data>"
++        << " --index <index_dir> --doclens <doclens> (--data <FP32-bin> | --fp16-npy <NPY>)"
+         << " --n-clusters <count> --ex-bits <count>\n\n"
+         << "Arguments:\n"
+         << "  --index, -i      Output index directory.\n"
+         << "  --doclens, -d    Input document-length file.\n"
+-        << "  --data           Input token-embedding file.\n"
++        << "  --data           Original raw FP32 token-embedding file.\n"
++        << "  --fp16-npy       Read-only C-order NPY <u2 raw FP16 bits or <f2 matrix.\n"
+         << "  --n-clusters     Number of centroids in the CAGRA graph.\n"
+         << "  --ex-bits        Residual quantization bits per dimension (1-7).\n";
+ }
+@@ -165,6 +184,10 @@
+         << "  --query <query_embeddings.bin>\n"
+         << "  --gt <groundtruth.tsv>\n"
+         << "  --index <index_dir>\n"
++        << "  [--thread-info]                Report actual OpenMP worker TIDs, CPUs and allowed masks after warmup.\n"
++        << "  [--low-memory]                 Read-only CPU full-code mmap and bounded clustered upload; save disabled.\n"
++        << "  [--profile-range]              Capture only 32 or 100 post-warmup queries; diagnostic, not QPS.\n"
++        << "  [--output <results.tsv>]        Write query/rank/doc/quantized_score/latency after measurement.\n"
+         << "  [--k <top_k>]                   Final documents returned. Default: "
+         << defaults.k << "\n"
+         << "  [--nq <num_queries>]            Evaluation queries; -1 means all. Default: "
+--- a/cpp/apps/utils.hpp
++++ b/cpp/apps/utils.hpp
+@@ -14,19 +14,24 @@
+ struct BuildCliArgs {
+     std::string index_dir;
+     std::string data_file;
++    std::string fp16_npy_file;
+     std::string doclens_file;
+     size_t n_clusters = 0;
+     size_t ex_bits = 0;
+ };
+ 
+ struct SearchCliArgs {
++    bool profile_range = false;
++    bool thread_info = false;
+     int k = 100;
+     int nq = -1;
+     int warmup = 5;
++    std::string output_file;
+     std::string query_file;
+     std::string gt_file;
+     std::string index_dir;
+     SearchOptions options;
++    LoadOptions load_options;
+ };
+ 
+ struct QueryLatencySummary {
+--- a/cpp/include/chimera/chimera_index.cuh
++++ b/cpp/include/chimera/chimera_index.cuh
+@@ -22,6 +22,15 @@
+ namespace Chimera {
+ 
+ struct IVF_PG;
++class FloatInputView;
++class ReadOnlyMappedFile;
++
++struct LoadOptions {
++    bool low_memory = false;
++    size_t transfer_chunk_bytes = 64ull * 1024ull * 1024ull;
++    // True reads mapped CPU pages once during load, before query timing.
++    bool prefault_full_codes = true;
++};
+ 
+ struct SearchOptions {
+     int nprobe = 128;
+@@ -53,6 +62,27 @@
+         size_t ex_bits,
+         const SearchOptions& options = {});
+ 
++    // Non-owning FP32 input; keep storage alive until this synchronous call returns.
++    // embedding_values is the number of floats, not the number of token vectors.
++    void build_from_ptr(
++        const float* embeddings,
++        size_t embedding_values,
++        size_t dimension,
++        const std::vector<int>& doc_lens,
++        size_t n_clusters,
++        size_t ex_bits,
++        const SearchOptions& options = {});
++
++    // IEEE FP16 bit patterns. Expanded exactly to FP32 in bounded CPU buffers.
++    void build_from_f16_ptr(
++        const uint16_t* embeddings,
++        size_t embedding_values,
++        size_t dimension,
++        const std::vector<int>& doc_lens,
++        size_t n_clusters,
++        size_t ex_bits,
++        const SearchOptions& options = {});
++
+     std::vector<size_t> search(
+         const std::vector<float>& query,
+         size_t k);
+@@ -61,15 +91,32 @@
+         size_t query_size,
+         size_t k);
+ 
++    // Optional observation only; disabled for original API callers.
++    void set_profiling_enabled(bool enabled) { profiling_enabled_ = enabled; }
++    void set_capture_scores(bool enabled) { capture_scores_ = enabled; }
++    const std::vector<float>& last_result_scores() const { return last_result_scores_; }
++
+     void save(const std::string& index_dir) const;
+     void load(
+         const std::string& index_dir,
+         const SearchOptions& options = {});
++    void load(
++        const std::string& index_dir,
++        const SearchOptions& options,
++        const LoadOptions& load_options);
+ 
+     chimera_index(const chimera_index&) = delete;
+     chimera_index& operator=(const chimera_index&) = delete;
+ 
+   private:
++    void build_from_view(
++        const FloatInputView& embeddings,
++        size_t dimension,
++        const std::vector<int>& doc_lens,
++        size_t n_clusters,
++        size_t ex_bits,
++        const SearchOptions& options);
++
+     struct QueryState;
+ 
+     struct IndexHeader {
+@@ -82,6 +129,7 @@
+ 
+     struct Workspace;
+ 
++    static void validate_search_options(const SearchOptions& options);
+     void begin_initialization(const SearchOptions& options);
+     void initialize_search_state();
+     std::vector<size_t> search_one(const float* queries, size_t k);
+@@ -114,6 +162,10 @@
+         const QueryState* queries,
+         std::pair<float, int>* full_bit_scores);
+ 
++    bool profiling_enabled_ = false;
++    bool capture_scores_ = false;
++    std::vector<float> last_result_scores_;
++
+     size_t n = 0;
+     size_t d = 0;
+     size_t n_clusters = 0;
+@@ -127,6 +179,11 @@
+     rabitqlib::Rotator<float>* rotator_ = nullptr;
+     IVF_PG* ivf = nullptr;
+     std::vector<char> full_bit_codes_;
++    std::unique_ptr<ReadOnlyMappedFile> mapped_full_bit_codes_;
++    const char* mapped_full_bit_data_ = nullptr;
++    LoadOptions load_options_;
++    bool low_memory_load_ = false;
++    std::string load_directory_;
+     std::vector<float> full_bit_factors_;
+     std::vector<std::uint64_t> one_bit_codes_;
+     std::vector<float> one_bit_factors_;
+--- a/cpp/include/chimera/config.cuh
++++ b/cpp/include/chimera/config.cuh
+@@ -28,3 +28,8 @@
+ static_assert(PADDED_DIM % 64 == 0, "PADDED_DIM must be a multiple of 64");
+ static_assert(PADDED_DIM > 0, "PADDED_DIM must be positive");
+ static_assert(Q_DOCLEN > 0, "Q_DOCLEN must be positive");
++
++// Shared host/kernel bound for candidate refinement shared-memory arrays.
++namespace Chimera {
++inline constexpr int kCandidateRefinementMaxNprobe = 512;
++}
+--- a/cpp/include/chimera/fp16_input.hpp
++++ b/cpp/include/chimera/fp16_input.hpp
+@@ -0,0 +1,50 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <stdexcept>
++
++namespace Chimera {
++
++// IEEE binary16 -> binary32, including NumPy-compatible quiet NaN payloads.
++// Always writes the exact converted bits; returns false if source has Inf/NaN.
++// Implementation is ordinary C++, with integer NEON only in a CXX translation unit.
++bool expand_fp16_to_fp32(const uint16_t* source, float* destination,
++                         size_t count) noexcept;
++
++class FloatInputView {
++ public:
++    FloatInputView(const float* source, size_t count)
++        : fp32_(source), fp16_(nullptr), count_(count) {}
++    FloatInputView(const uint16_t* source, size_t count)
++        : fp32_(nullptr), fp16_(source), count_(count) {}
++    size_t size() const { return count_; }
++    bool empty() const { return count_ == 0 || (fp32_ == nullptr && fp16_ == nullptr); }
++    bool is_fp16() const { return fp16_ != nullptr; }
++    const float* float_data() const { return fp32_; }
++    void copy_to(float* destination, size_t offset, size_t count) const {
++        if (offset > count_ || count > count_ - offset) {
++            throw std::out_of_range("Embedding input view read exceeds source");
++        }
++        if (fp16_ != nullptr) {
++            if (!expand_fp16_to_fp32(fp16_ + offset, destination, count)) {
++                throw std::invalid_argument("FP16 input contains Inf or NaN");
++            }
++        } else if (count != 0) {
++            std::memcpy(destination, fp32_ + offset, count * sizeof(float));
++        }
++    }
++    // encode_embeddings runs only after assignment has checked every FP16 row.
++    // No exceptions inside its OpenMP region; the source is immutable during build.
++    const float* row_data(size_t offset, size_t count, float* scratch) const noexcept {
++        if (fp16_ == nullptr) return fp32_ + offset;
++        (void)expand_fp16_to_fp32(fp16_ + offset, scratch, count);
++        return scratch;
++    }
++ private:
++    const float* fp32_;
++    const uint16_t* fp16_;
++    size_t count_;
++};
++
++}  // namespace Chimera
+--- a/cpp/include/chimera/index_file_io.hpp
++++ b/cpp/include/chimera/index_file_io.hpp
+@@ -0,0 +1,109 @@
++#pragma once
++
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <fstream>
++#include <limits>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace Chimera {
++
++// A raw, immutable index payload, not a CUDA-mapped allocation.
++class ReadOnlyMappedFile {
++ public:
++    ReadOnlyMappedFile(const std::string& path, size_t expected_bytes) {
++        struct Descriptor {
++            int value;
++            ~Descriptor() { if (value >= 0) (void)::close(value); }
++        } fd{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
++        if (fd.value < 0) fail("open", path);
++        struct stat state {};
++        if (::fstat(fd.value, &state) != 0) fail("fstat", path);
++        if (!S_ISREG(state.st_mode) || expected_bytes == 0 || state.st_size < 0 ||
++            static_cast<uintmax_t>(state.st_size) != static_cast<uintmax_t>(expected_bytes)) {
++            throw std::runtime_error("Index payload size/type mismatch: " + path);
++        }
++        bytes_ = expected_bytes;
++        mapping_ = ::mmap(nullptr, bytes_, PROT_READ, MAP_PRIVATE, fd.value, 0);
++        if (mapping_ == MAP_FAILED) fail("mmap", path);
++        // CPU random full-bit scoring reads ordinary file-backed pages.
++        (void)::madvise(mapping_, bytes_, MADV_RANDOM);
++    }
++    ~ReadOnlyMappedFile() {
++        if (mapping_ != MAP_FAILED) (void)::munmap(mapping_, bytes_);
++    }
++    ReadOnlyMappedFile(const ReadOnlyMappedFile&) = delete;
++    ReadOnlyMappedFile& operator=(const ReadOnlyMappedFile&) = delete;
++    const char* data() const { return static_cast<const char*>(mapping_); }
++    size_t size() const { return bytes_; }
++    // Match the original eager file read before query timing. Pages remain
++    // reclaimable; this is not mlock or guaranteed residency under memory pressure.
++    void prefault() const {
++        const long configured = ::sysconf(_SC_PAGESIZE);
++        const size_t page = configured > 0 ? static_cast<size_t>(configured) : 4096;
++        const volatile char* data = static_cast<const char*>(mapping_);
++        for (size_t offset = 0; offset < bytes_; offset += page) {
++            const char value = data[offset];
++            (void)value;
++        }
++    }
++ private:
++    [[noreturn]] static void fail(const char* operation, const std::string& path) {
++        const int error = errno;
++        throw std::runtime_error(std::string(operation) + " failed for " + path + ": " + std::strerror(error));
++    }
++    void* mapping_ = MAP_FAILED;
++    size_t bytes_ = 0;
++};
++
++inline void reject_readonly_index_save(bool low_memory_load) {
++    if (low_memory_load) {
++        throw std::logic_error("save() is unavailable after low-memory load; reload with default LoadOptions before saving");
++    }
++}
++
++// Read each serialized segment into a single bounded host buffer. consume receives
++// (segment index, segment-relative offset, bytes, count); it must finish reading
++// the buffer before returning. cudaMemcpy's synchronous H2D form satisfies this.
++template <typename Consumer>
++void stream_index_segments(const std::string& path,
++                           const std::vector<size_t>& segment_bytes,
++                           size_t buffer_bytes, Consumer consume) {
++    if (buffer_bytes == 0 || buffer_bytes > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
++        throw std::invalid_argument("Index streaming buffer size must be positive and fit streamsize");
++    }
++    size_t total = 0;
++    for (const size_t count : segment_bytes) {
++        if (count > std::numeric_limits<size_t>::max() - total) {
++            throw std::overflow_error("Index segment sizes overflow size_t");
++        }
++        total += count;
++    }
++    std::ifstream input(path, std::ios::binary | std::ios::ate);
++    if (!input || input.tellg() < 0 || static_cast<uintmax_t>(input.tellg()) != static_cast<uintmax_t>(total)) {
++        throw std::runtime_error("Clustered index payload size mismatch: " + path);
++    }
++    input.seekg(0);
++    std::vector<char> buffer(std::min(total, buffer_bytes));
++    for (size_t segment = 0; segment < segment_bytes.size(); ++segment) {
++        for (size_t offset = 0; offset < segment_bytes[segment];) {
++            const size_t count = std::min(buffer.size(), segment_bytes[segment] - offset);
++            input.read(buffer.data(), static_cast<std::streamsize>(count));
++            if (!input) throw std::runtime_error("Short clustered index read: " + path);
++            consume(segment, offset, buffer.data(), count);
++            offset += count;
++        }
++    }
++}
++
++}  // namespace Chimera
+--- a/cpp/include/chimera/kernels.cuh
++++ b/cpp/include/chimera/kernels.cuh
+@@ -61,7 +61,6 @@
+ inline constexpr int kCandidateBitmapBucketWidth = 32;
+ inline constexpr int kCandidateBitmapCompressionRatio = 8;
+ inline constexpr size_t kCandidateRefinementClusterAlignment = 8;
+-inline constexpr int kCandidateRefinementMaxNprobe = 512;
+ 
+ inline constexpr size_t candidate_bitmap_num_buckets(size_t num_docs) {
+     const size_t raw =
+--- a/cpp/include/chimera/profiling.hpp
++++ b/cpp/include/chimera/profiling.hpp
+@@ -0,0 +1,28 @@
++#pragma once
++#include <cstdint>
++#include <nvtx3/nvToolsExt.h>
++namespace Chimera {
++// Host scopes annotate submission, waits and CPU execution. They add no CUDA
++// synchronization and are not GPU-exclusive durations. Disabled by default.
++class ProfileRange {
++ public:
++    ProfileRange(bool enabled, const char* name, int64_t payload = -1) : enabled_(enabled) {
++        if (!enabled_) return;
++        nvtxEventAttributes_t attr{};
++        attr.version = NVTX_VERSION;
++        attr.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
++        attr.messageType = NVTX_MESSAGE_TYPE_ASCII;
++        attr.message.ascii = name;
++        if (payload >= 0) {
++            attr.payloadType = NVTX_PAYLOAD_TYPE_INT64;
++            attr.payload.llValue = payload;
++        }
++        nvtxRangePushEx(&attr);
++    }
++    ~ProfileRange() { if (enabled_) nvtxRangePop(); }
++    ProfileRange(const ProfileRange&) = delete;
++    ProfileRange& operator=(const ProfileRange&) = delete;
++ private:
++    bool enabled_;
++};
++}
+--- a/cpp/src/build_index.cu
++++ b/cpp/src/build_index.cu
+@@ -23,6 +23,8 @@
+ #include <vector>
+ 
+ #include "chimera/config.cuh"
++#include "chimera/fp16_input.hpp"
++#include "chimera/index_file_io.hpp"
+ #include "chimera/ivf_pg.hpp"
+ #include "chimera/quantization.hpp"
+ #include "rabitqlib/utils/rotator.hpp"
+@@ -32,6 +34,13 @@
+ using namespace rabitqlib;
+ 
+ namespace {
++
++using FloatView = FloatInputView;
++
++template <typename T>
++void release_vector(std::vector<T>& data) {
++    std::vector<T>().swap(data);
++}
+ 
+ constexpr std::uint64_t kCentroidSampleSeed = 42;
+ constexpr std::uint64_t kRotatorSeed = 42;
+@@ -73,7 +82,7 @@
+ }
+ 
+ size_t validate_build_inputs(
+-    const std::vector<float>& embeddings,
++    FloatView embeddings,
+     size_t dimension,
+     const std::vector<int>& doc_lens,
+     size_t n_clusters,
+@@ -157,7 +166,7 @@
+ }
+ 
+ std::vector<float> sample_centroids(
+-    const std::vector<float>& embeddings,
++    FloatView embeddings,
+     size_t num_embeddings,
+     size_t dimension,
+     size_t n_clusters) {
+@@ -175,16 +184,15 @@
+ 
+     std::vector<float> centroids(checked_product(n_clusters, dimension, "centroids"));
+     for (size_t cluster = 0; cluster < n_clusters; ++cluster) {
+-        std::memcpy(
++        embeddings.copy_to(
+             centroids.data() + cluster * dimension,
+-            embeddings.data() + sampled_ids[cluster] * dimension,
+-            dimension * sizeof(float));
++            sampled_ids[cluster] * dimension, dimension);
+     }
+     return centroids;
+ }
+ 
+ std::vector<uint32_t> assign_embeddings(
+-    const std::vector<float>& embeddings,
++    FloatView embeddings,
+     size_t num_embeddings,
+     size_t dimension,
+     const std::vector<float>& centroids,
+@@ -198,13 +206,23 @@
+     DeviceBuffer<uint32_t> device_labels(batch_capacity);
+     DeviceBuffer<float> device_distances(batch_capacity);
+ 
++    // Only FP16 input allocates an additional FP32 host assignment batch.
++    std::vector<float> expanded_batch;
++    if (embeddings.is_fp16()) expanded_batch.resize(batch_capacity * dimension);
+     std::vector<uint32_t> assignments(num_embeddings);
+     for (size_t start = 0; start < num_embeddings; start += batch_capacity) {
+         const size_t count = std::min(batch_capacity, num_embeddings - start);
++        const float* source = nullptr;
++        if (embeddings.is_fp16()) {
++            embeddings.copy_to(expanded_batch.data(), start * dimension, count * dimension);
++            source = expanded_batch.data();
++        } else {
++            source = embeddings.float_data() + start * dimension;
++        }
+         check_cuda(
+             cudaMemcpy(
+                 device_embeddings.data(),
+-                embeddings.data() + start * dimension,
++                source,
+                 count * dimension * sizeof(float),
+                 cudaMemcpyHostToDevice),
+             "Copying embeddings to the GPU");
+@@ -250,13 +268,13 @@
+ 
+ struct EncodedDocuments {
+     std::vector<uint64_t> one_bit_codes;
+-    std::vector<uint8_t> full_codes;
++    std::vector<char> full_codes;
+     std::vector<float> one_bit_factors;
+     std::vector<float> full_code_factors;
+ };
+ 
+ EncodedDocuments encode_embeddings(
+-    const std::vector<float>& embeddings,
++    FloatView embeddings,
+     size_t num_embeddings,
+     size_t dimension,
+     size_t ex_bits,
+@@ -267,7 +285,7 @@
+     EncodedDocuments encoded {
+         std::vector<uint64_t>(checked_product(
+             num_embeddings, one_bit_words_per_vector, "one-bit codes")),
+-        std::vector<uint8_t>(checked_product(
++        std::vector<char>(checked_product(
+             num_embeddings, full_code_bytes_per_vector, "full codes")),
+         std::vector<float>(num_embeddings),
+         std::vector<float>(num_embeddings),
+@@ -276,6 +294,7 @@
+ #pragma omp parallel
+     {
+         std::vector<float> rotated(PADDED_DIM);
++        std::array<float, PADDED_DIM> expanded_row;
+ 
+ #pragma omp for schedule(static)
+         for (std::int64_t row = 0;
+@@ -283,7 +302,7 @@
+              ++row) {
+             const size_t index = static_cast<size_t>(row);
+             rotator.rotate(
+-                embeddings.data() + index * dimension,
++                embeddings.row_data(index * dimension, dimension, expanded_row.data()),
+                 rotated.data());
+             encode_one_bit(
+                 rotated.data(),
+@@ -294,7 +313,7 @@
+                 rotated.data(),
+                 PADDED_DIM,
+                 ex_bits,
+-                encoded.full_codes.data() + index * full_code_bytes_per_vector,
++                reinterpret_cast<uint8_t*>(encoded.full_codes.data()) + index * full_code_bytes_per_vector,
+                 &encoded.full_code_factors[index]);
+         }
+     }
+@@ -318,48 +337,40 @@
+     return token_doc_ids;
+ }
+ 
+-struct ClusteredDocuments {
+-    std::vector<char> one_bit_codes;
+-    std::vector<float> one_bit_factors;
+-    std::vector<int> doc_ids;
+-    std::vector<uint32_t> token_to_cluster_position;
+-};
+-
+-ClusteredDocuments reorder_by_cluster(
++// Fill the final serialized layout directly, avoiding a second 28*N-byte copy.
++std::vector<char> reorder_by_cluster(
+     const EncodedDocuments& encoded,
+     const IVF_PG& ivf,
+     const std::vector<int>& token_doc_ids) {
+     const size_t num_embeddings = ivf.inv_list.size();
+     const size_t code_bytes_per_vector = PADDED_DIM / 8;
+-    ClusteredDocuments clustered {
+-        std::vector<char>(checked_product(
+-            num_embeddings, code_bytes_per_vector, "clustered one-bit codes")),
+-        std::vector<float>(num_embeddings),
+-        std::vector<int>(num_embeddings),
+-        std::vector<uint32_t>(num_embeddings),
+-    };
+-
+-    const auto* source_codes =
+-        reinterpret_cast<const char*>(encoded.one_bit_codes.data());
++    const size_t code_bytes = checked_product(num_embeddings, code_bytes_per_vector, "clustered one-bit codes");
++    const size_t factor_bytes = checked_product(num_embeddings, sizeof(float), "clustered factors");
++    const size_t doc_bytes = checked_product(num_embeddings, sizeof(int), "clustered document IDs");
++    const size_t position_bytes = checked_product(num_embeddings, sizeof(uint32_t), "clustered token positions");
++    std::vector<char> output(code_bytes + factor_bytes + doc_bytes + position_bytes);
++    char* codes = output.data();
++    char* factors = codes + code_bytes;
++    char* docs = factors + factor_bytes;
++    char* positions = docs + doc_bytes;
++    const auto* source_codes = reinterpret_cast<const char*>(encoded.one_bit_codes.data());
+ #pragma omp parallel for schedule(static)
+     for (std::int64_t position = 0;
+-         position < static_cast<std::int64_t>(num_embeddings);
+-         ++position) {
++         position < static_cast<std::int64_t>(num_embeddings); ++position) {
+         const size_t cluster_position = static_cast<size_t>(position);
+         const uint32_t token_id = ivf.inv_list[cluster_position];
+-        std::memcpy(
+-            clustered.one_bit_codes.data() +
+-                cluster_position * code_bytes_per_vector,
+-            source_codes + static_cast<size_t>(token_id) * code_bytes_per_vector,
+-            code_bytes_per_vector);
+-        clustered.one_bit_factors[cluster_position] =
+-            encoded.one_bit_factors[token_id];
+-        clustered.doc_ids[cluster_position] = token_doc_ids[token_id];
+-        clustered.token_to_cluster_position[token_id] =
+-            static_cast<uint32_t>(cluster_position);
+-    }
+-
+-    return clustered;
++        std::memcpy(codes + cluster_position * code_bytes_per_vector,
++                    source_codes + static_cast<size_t>(token_id) * code_bytes_per_vector,
++                    code_bytes_per_vector);
++        std::memcpy(factors + cluster_position * sizeof(float),
++                    &encoded.one_bit_factors[token_id], sizeof(float));
++        std::memcpy(docs + cluster_position * sizeof(int),
++                    &token_doc_ids[token_id], sizeof(int));
++        const auto compact_position = static_cast<uint32_t>(cluster_position);
++        std::memcpy(positions + static_cast<size_t>(token_id) * sizeof(uint32_t),
++                    &compact_position, sizeof(uint32_t));
++    }
++    return output;
+ }
+ 
+ std::ofstream open_binary_output(const std::string& path) {
+@@ -398,6 +409,42 @@
+     size_t n_clusters,
+     size_t ex_bits,
+     const SearchOptions& options) {
++    build_from_ptr(embeddings.data(), embeddings.size(), dimension, doc_lens,
++                   n_clusters, ex_bits, options);
++}
++
++void chimera_index::build_from_ptr(
++    const float* embedding_data,
++    size_t embedding_values,
++    size_t dimension,
++    const std::vector<int>& doc_lens,
++    size_t n_clusters,
++    size_t ex_bits,
++    const SearchOptions& options) {
++    build_from_view(FloatInputView(embedding_data, embedding_values), dimension,
++                    doc_lens, n_clusters, ex_bits, options);
++}
++
++void chimera_index::build_from_f16_ptr(
++    const uint16_t* embedding_data,
++    size_t embedding_values,
++    size_t dimension,
++    const std::vector<int>& doc_lens,
++    size_t n_clusters,
++    size_t ex_bits,
++    const SearchOptions& options) {
++    build_from_view(FloatInputView(embedding_data, embedding_values), dimension,
++                    doc_lens, n_clusters, ex_bits, options);
++}
++
++void chimera_index::build_from_view(
++    const FloatInputView& embeddings,
++    size_t dimension,
++    const std::vector<int>& doc_lens,
++    size_t n_clusters,
++    size_t ex_bits,
++    const SearchOptions& options) {
++    validate_search_options(options);
+     const size_t num_embeddings = validate_build_inputs(
+         embeddings,
+         dimension,
+@@ -449,6 +496,9 @@
+     delete ivf->pg_index;
+     ivf->pg_index = centroid_graph.release();
+     ivf->build_from_assignments(assignments.data(), num_embeddings);
++    release_vector(assignments);
++    release_vector(centroids);
++    release_vector(rotated_centroids);
+ 
+     auto encoded = encode_embeddings(
+         embeddings,
+@@ -456,51 +506,23 @@
+         dimension,
+         ex_bits,
+         *rotator);
+-    const auto token_doc_ids = make_token_doc_ids(doc_lens, num_embeddings);
++    auto token_doc_ids = make_token_doc_ids(doc_lens, num_embeddings);
+     auto clustered = reorder_by_cluster(encoded, *ivf, token_doc_ids);
++    release_vector(token_doc_ids);
+ 
+     rotator_ = rotator.release();
+     one_bit_codes_ = std::move(encoded.one_bit_codes);
+     one_bit_factors_ = std::move(encoded.one_bit_factors);
+     full_bit_factors_ = std::move(encoded.full_code_factors);
+-    full_bit_codes_.assign(
+-        reinterpret_cast<const char*>(encoded.full_codes.data()),
+-        reinterpret_cast<const char*>(encoded.full_codes.data() + encoded.full_codes.size()));
+-
+-    const size_t clustered_code_bytes = clustered.one_bit_codes.size();
+-    const size_t clustered_factor_bytes =
+-        clustered.one_bit_factors.size() * sizeof(float);
+-    const size_t clustered_doc_id_bytes = clustered.doc_ids.size() * sizeof(int);
+-    const size_t clustered_position_bytes =
+-        clustered.token_to_cluster_position.size() * sizeof(uint32_t);
+-    clustered_data_.resize(
+-        clustered_code_bytes + clustered_factor_bytes +
+-        clustered_doc_id_bytes + clustered_position_bytes);
+-    char* clustered_output = clustered_data_.data();
+-    std::memcpy(
+-        clustered_output,
+-        clustered.one_bit_codes.data(),
+-        clustered_code_bytes);
+-    clustered_output += clustered_code_bytes;
+-    std::memcpy(
+-        clustered_output,
+-        clustered.one_bit_factors.data(),
+-        clustered_factor_bytes);
+-    clustered_output += clustered_factor_bytes;
+-    std::memcpy(
+-        clustered_output,
+-        clustered.doc_ids.data(),
+-        clustered_doc_id_bytes);
+-    clustered_output += clustered_doc_id_bytes;
+-    std::memcpy(
+-        clustered_output,
+-        clustered.token_to_cluster_position.data(),
+-        clustered_position_bytes);
++    full_bit_codes_ = std::move(encoded.full_codes);
++    clustered_data_ = std::move(clustered);
+ 
+     has_index_ = true;
+ }
+ 
+ void chimera_index::save(const std::string& index_dir) const {
++    // Reject before prepare_output_directory can remove existing payloads.
++    reject_readonly_index_save(low_memory_load_);
+     if (!has_index_) {
+         throw std::runtime_error("Cannot save an empty Chimera index");
+     }
+--- a/cpp/src/chimera_index.cu
++++ b/cpp/src/chimera_index.cu
+@@ -6,6 +6,7 @@
+ 
+ #include "chimera/config.cuh"
+ #include "chimera/io.hpp"
++#include "chimera/index_file_io.hpp"
+ #include "chimera/ivf_pg.hpp"
+ #include "chimera/quantization.hpp"
+ #include "chimera_index_internal.cuh"
+@@ -22,20 +23,21 @@
+ 
+ namespace Chimera {
+ 
+-namespace {
+-
+-void validate_search_options(const SearchOptions& options) {
++void chimera_index::validate_search_options(const SearchOptions& options) {
+     if (options.nprobe <= 0 || options.k_refine <= 0 ||
+         options.k_full_bit <= 0 || options.cagra_itopk_size <= 0 ||
+         options.num_chunks <= 0) {
+         throw std::invalid_argument("All Chimera search options must be positive");
+     }
++    if (options.nprobe > kCandidateRefinementMaxNprobe) {
++        throw std::invalid_argument(
++            "nprobe must not exceed candidate refinement limit " +
++            std::to_string(kCandidateRefinementMaxNprobe));
++    }
+     if (options.k_full_bit > options.k_refine) {
+         throw std::invalid_argument("k_full_bit must not exceed k_refine");
+     }
+ }
+-
+-}  // namespace
+ 
+ chimera_index::chimera_index() = default;
+ 
+@@ -54,6 +56,17 @@
+ void chimera_index::load(
+     const std::string& index_dir,
+     const SearchOptions& options) {
++    load(index_dir, options, LoadOptions {});
++}
++
++void chimera_index::load(
++    const std::string& index_dir,
++    const SearchOptions& options,
++    const LoadOptions& load_options) {
++    validate_search_options(options);
++    if (load_options.transfer_chunk_bytes == 0) {
++        throw std::invalid_argument("Load transfer_chunk_bytes must be positive");
++    }
+     const std::filesystem::path directory(index_dir);
+     if (!std::filesystem::is_directory(directory)) {
+         throw std::runtime_error(
+@@ -67,6 +80,18 @@
+     }
+     check_cuda(cudaSetDevice(0), "Selecting CUDA device 0");
+     begin_initialization(options);
++    load_options_ = load_options;
++    low_memory_load_ = load_options.low_memory;
++    load_directory_ = std::filesystem::absolute(directory).string();
++    if (low_memory_load_) {
++        // release_resources clears vector sizes; drop capacities from a previous
++        // ordinary load too so switching modes on the same object saves memory.
++        std::vector<char>().swap(full_bit_codes_);
++        std::vector<uint64_t>().swap(one_bit_codes_);
++        std::vector<float>().swap(one_bit_factors_);
++        std::vector<char>().swap(clustered_data_);
++        std::vector<float>().swap(full_bit_factors_);
++    }
+ 
+     const auto doclens_path = (directory / "doclens.bin").string();
+     const auto doc_one_bit_path = (directory / "doc_1bit.bin").string();
+@@ -115,29 +140,38 @@
+         throw std::runtime_error("Failed to read rotator from " + doc_one_bit_path);
+     }
+ 
+-    one_bit_codes_.resize(n * (PADDED_DIM / 64));
+-    one_bit_factors_.resize(n);
+-    full_bit_codes_.resize(n * PADDED_DIM * (1 + ex_bits) / 8);
+     full_bit_factors_.resize(n);
+-
+-    inf.read(
+-        reinterpret_cast<char*>(one_bit_codes_.data()),
+-        static_cast<std::streamsize>(one_bit_codes_.size() * sizeof(uint64_t)));
+-    inf.read(
+-        reinterpret_cast<char*>(one_bit_factors_.data()),
+-        static_cast<std::streamsize>(one_bit_factors_.size() * sizeof(float)));
+-    inf.read(
+-        reinterpret_cast<char*>(full_bit_factors_.data()),
+-        static_cast<std::streamsize>(full_bit_factors_.size() * sizeof(float)));
++    if (low_memory_load_) {
++        // doc_1bit.bin after its rotator stores codes[16*N], one-bit
++        // factors[4*N], then CPU full-bit factors[4*N]. Search uses only
++        // the last segment on CPU; GPU 1-bit data comes from cluster_1bit.bin.
++        const size_t skip = n * (PADDED_DIM / 8 + sizeof(float));
++        inf.seekg(static_cast<std::streamoff>(skip), std::ios::cur);
++    } else {
++        one_bit_codes_.resize(n * (PADDED_DIM / 64));
++        one_bit_factors_.resize(n);
++        inf.read(reinterpret_cast<char*>(one_bit_codes_.data()),
++                 static_cast<std::streamsize>(one_bit_codes_.size() * sizeof(uint64_t)));
++        inf.read(reinterpret_cast<char*>(one_bit_factors_.data()),
++                 static_cast<std::streamsize>(one_bit_factors_.size() * sizeof(float)));
++    }
++    inf.read(reinterpret_cast<char*>(full_bit_factors_.data()),
++             static_cast<std::streamsize>(full_bit_factors_.size() * sizeof(float)));
+     if (!inf) {
+-        throw std::runtime_error(
+-            "Failed to read quantized payload from " + doc_one_bit_path);
+-    }
+-    std::ifstream full_bit_codes_file(doc_full_path, std::ios::binary);
+-    full_bit_codes_file.read(full_bit_codes_.data(), full_bit_codes_.size());
+-    if (!full_bit_codes_file) {
+-        throw std::runtime_error(
+-            "Failed to read full-code payload from " + doc_full_path);
++        throw std::runtime_error("Failed to read quantized payload from " + doc_one_bit_path);
++    }
++    const size_t full_code_bytes = n * PADDED_DIM * (1 + ex_bits) / 8;
++    if (low_memory_load_) {
++        mapped_full_bit_codes_ = std::make_unique<ReadOnlyMappedFile>(doc_full_path, full_code_bytes);
++        mapped_full_bit_data_ = mapped_full_bit_codes_->data();
++        if (load_options_.prefault_full_codes) mapped_full_bit_codes_->prefault();
++    } else {
++        full_bit_codes_.resize(full_code_bytes);
++        std::ifstream full_bit_codes_file(doc_full_path, std::ios::binary);
++        full_bit_codes_file.read(full_bit_codes_.data(), full_bit_codes_.size());
++        if (!full_bit_codes_file) {
++            throw std::runtime_error("Failed to read full-code payload from " + doc_full_path);
++        }
+     }
+     ivf = new IVF_PG(n_clusters, d);
+     ivf->load(ivf_path, centroids_path);
+@@ -153,14 +187,14 @@
+         throw std::runtime_error(
+             "Invalid clustered index payload: " + cluster_one_bit_path);
+     }
+-    clustered_data_.resize(clustered_bytes);
+-    clustered_file.seekg(0);
+-    clustered_file.read(
+-        clustered_data_.data(),
+-        static_cast<std::streamsize>(clustered_data_.size()));
+-    if (!clustered_file) {
+-        throw std::runtime_error(
+-            "Failed to read clustered index: " + cluster_one_bit_path);
++    if (!low_memory_load_) {
++        clustered_data_.resize(clustered_bytes);
++        clustered_file.seekg(0);
++        clustered_file.read(clustered_data_.data(),
++                            static_cast<std::streamsize>(clustered_data_.size()));
++        if (!clustered_file) {
++            throw std::runtime_error("Failed to read clustered index: " + cluster_one_bit_path);
++        }
+     }
+ 
+     has_index_ = true;
+@@ -203,44 +237,56 @@
+     const size_t code_per_vec = PADDED_DIM / 8;
+     const size_t expected_clustered_bytes =
+         n * (code_per_vec + sizeof(float) + sizeof(int) + sizeof(uint32_t));
+-    if (clustered_data_.size() != expected_clustered_bytes) {
++    if (!low_memory_load_ && clustered_data_.size() != expected_clustered_bytes) {
+         throw std::runtime_error("Invalid in-memory clustered index payload");
+     }
+ 
+     size_t free_mem = 0;
+     [[maybe_unused]] size_t total_mem = 0;
+     check_cuda(cudaMemGetInfo(&free_mem, &total_mem));
+-    if (free_mem <= clustered_data_.size()) {
++    if (free_mem <= expected_clustered_bytes) {
+         throw std::runtime_error(
+             "Insufficient GPU memory for clustered index: need " +
+-            std::to_string(clustered_data_.size()) + " bytes, have " +
++            std::to_string(expected_clustered_bytes) + " bytes, have " +
+             std::to_string(free_mem) + " bytes free");
+     }
+-
+-    const char* clustered_code = clustered_data_.data();
+-    const auto* clustered_factor = reinterpret_cast<const float*>(
+-        clustered_code + n * code_per_vec);
+-    const auto* clustered_doc_ids = reinterpret_cast<const int*>(
+-        reinterpret_cast<const char*>(clustered_factor) + n * sizeof(float));
+-    const auto* token_to_cluster_pos = reinterpret_cast<const uint32_t*>(
+-        reinterpret_cast<const char*>(clustered_doc_ids) + n * sizeof(int));
+ 
+     check_cuda(cudaMalloc(&d_clustered_one_bit_codes_, n * code_per_vec));
+     check_cuda(cudaMalloc(&d_clustered_one_bit_factors_, n * sizeof(float)));
+     check_cuda(cudaMalloc(&d_clustered_doc_ids_, n * sizeof(int)));
+     check_cuda(cudaMalloc(&d_token_to_cluster_pos_, n * sizeof(uint32_t)));
+-    check_cuda(cudaMemcpy(
+-        d_clustered_one_bit_codes_, clustered_code,
+-        n * code_per_vec, cudaMemcpyHostToDevice));
+-    check_cuda(cudaMemcpy(
+-        d_clustered_one_bit_factors_, clustered_factor,
+-        n * sizeof(float), cudaMemcpyHostToDevice));
+-    check_cuda(cudaMemcpy(
+-        d_clustered_doc_ids_, clustered_doc_ids,
+-        n * sizeof(int), cudaMemcpyHostToDevice));
+-    check_cuda(cudaMemcpy(
+-        d_token_to_cluster_pos_, token_to_cluster_pos,
+-        n * sizeof(uint32_t), cudaMemcpyHostToDevice));
++
++    if (low_memory_load_) {
++        const auto path = (std::filesystem::path(load_directory_) / "cluster_1bit.bin").string();
++        const std::vector<size_t> sizes = {
++            n * code_per_vec, n * sizeof(float), n * sizeof(int), n * sizeof(uint32_t)};
++        char* destinations[] = {
++            d_clustered_one_bit_codes_,
++            reinterpret_cast<char*>(d_clustered_one_bit_factors_),
++            reinterpret_cast<char*>(d_clustered_doc_ids_),
++            reinterpret_cast<char*>(d_token_to_cluster_pos_)};
++        stream_index_segments(path, sizes, load_options_.transfer_chunk_bytes,
++            [&](size_t segment, size_t offset, const char* data, size_t count) {
++                check_cuda(cudaMemcpy(destinations[segment] + offset, data, count,
++                                      cudaMemcpyHostToDevice));
++            });
++    } else {
++        const char* clustered_code = clustered_data_.data();
++        const auto* clustered_factor = reinterpret_cast<const float*>(
++            clustered_code + n * code_per_vec);
++        const auto* clustered_doc_ids = reinterpret_cast<const int*>(
++            reinterpret_cast<const char*>(clustered_factor) + n * sizeof(float));
++        const auto* token_to_cluster_pos = reinterpret_cast<const uint32_t*>(
++            reinterpret_cast<const char*>(clustered_doc_ids) + n * sizeof(int));
++        check_cuda(cudaMemcpy(d_clustered_one_bit_codes_, clustered_code,
++                              n * code_per_vec, cudaMemcpyHostToDevice));
++        check_cuda(cudaMemcpy(d_clustered_one_bit_factors_, clustered_factor,
++                              n * sizeof(float), cudaMemcpyHostToDevice));
++        check_cuda(cudaMemcpy(d_clustered_doc_ids_, clustered_doc_ids,
++                              n * sizeof(int), cudaMemcpyHostToDevice));
++        check_cuda(cudaMemcpy(d_token_to_cluster_pos_, token_to_cluster_pos,
++                              n * sizeof(uint32_t), cudaMemcpyHostToDevice));
++    }
+ 
+     compute_candidate_bounds();
+     allocate_workspace();
+--- a/cpp/src/cpu_gemv_neon.hpp
++++ b/cpp/src/cpu_gemv_neon.hpp
+@@ -0,0 +1,66 @@
++#pragma once
++// ARM hardware adaptation: four query vectors keep all 16-lane accumulators
++// resident in NEON registers. The FP32 FMA and reduction tree match AVX512.
++#if defined(__aarch64__)
++#include <arm_neon.h>
++
++namespace rabitqlib {
++inline float reduce16_neon(float32x4_t a0,float32x4_t a1,float32x4_t a2,float32x4_t a3) {
++ const float32x4_t v=vaddq_f32(vaddq_f32(a0,a2),vaddq_f32(a1,a3));
++ return (vgetq_lane_f32(v,0)+vgetq_lane_f32(v,2))+(vgetq_lane_f32(v,1)+vgetq_lane_f32(v,3));
++}
++inline void gemv_batch4_neon(const float* __restrict__ query,const float* __restrict__ decoded,float* __restrict__ result,size_t nq,size_t dim) {
++ size_t j=0;
++ for(;j+4<=nq;j+=4) {
++ const float* q0=query+(j+0)*dim;
++ float32x4_t s00=vdupq_n_f32(0);
++ float32x4_t s01=vdupq_n_f32(0);
++ float32x4_t s02=vdupq_n_f32(0);
++ float32x4_t s03=vdupq_n_f32(0);
++ const float* q1=query+(j+1)*dim;
++ float32x4_t s10=vdupq_n_f32(0);
++ float32x4_t s11=vdupq_n_f32(0);
++ float32x4_t s12=vdupq_n_f32(0);
++ float32x4_t s13=vdupq_n_f32(0);
++ const float* q2=query+(j+2)*dim;
++ float32x4_t s20=vdupq_n_f32(0);
++ float32x4_t s21=vdupq_n_f32(0);
++ float32x4_t s22=vdupq_n_f32(0);
++ float32x4_t s23=vdupq_n_f32(0);
++ const float* q3=query+(j+3)*dim;
++ float32x4_t s30=vdupq_n_f32(0);
++ float32x4_t s31=vdupq_n_f32(0);
++ float32x4_t s32=vdupq_n_f32(0);
++ float32x4_t s33=vdupq_n_f32(0);
++ for(size_t d=0;d<dim;d+=16) {
++ const float32x4_t v0=vld1q_f32(decoded+d+0);
++ const float32x4_t v1=vld1q_f32(decoded+d+4);
++ const float32x4_t v2=vld1q_f32(decoded+d+8);
++ const float32x4_t v3=vld1q_f32(decoded+d+12);
++ s00=vfmaq_f32(s00,v0,vld1q_f32(q0+d+0));
++ s01=vfmaq_f32(s01,v1,vld1q_f32(q0+d+4));
++ s02=vfmaq_f32(s02,v2,vld1q_f32(q0+d+8));
++ s03=vfmaq_f32(s03,v3,vld1q_f32(q0+d+12));
++ s10=vfmaq_f32(s10,v0,vld1q_f32(q1+d+0));
++ s11=vfmaq_f32(s11,v1,vld1q_f32(q1+d+4));
++ s12=vfmaq_f32(s12,v2,vld1q_f32(q1+d+8));
++ s13=vfmaq_f32(s13,v3,vld1q_f32(q1+d+12));
++ s20=vfmaq_f32(s20,v0,vld1q_f32(q2+d+0));
++ s21=vfmaq_f32(s21,v1,vld1q_f32(q2+d+4));
++ s22=vfmaq_f32(s22,v2,vld1q_f32(q2+d+8));
++ s23=vfmaq_f32(s23,v3,vld1q_f32(q2+d+12));
++ s30=vfmaq_f32(s30,v0,vld1q_f32(q3+d+0));
++ s31=vfmaq_f32(s31,v1,vld1q_f32(q3+d+4));
++ s32=vfmaq_f32(s32,v2,vld1q_f32(q3+d+8));
++ s33=vfmaq_f32(s33,v3,vld1q_f32(q3+d+12));
++ }
++ result[j+0]=reduce16_neon(s00,s01,s02,s03);
++ result[j+1]=reduce16_neon(s10,s11,s12,s13);
++ result[j+2]=reduce16_neon(s20,s21,s22,s23);
++ result[j+3]=reduce16_neon(s30,s31,s32,s33);
++ }
++ for(;j<nq;++j) result[j]=dot_f32_avx512(query+j*dim,decoded,dim);
++}
++}
++
++#endif
+--- a/cpp/src/cpu_scoring.cpp
++++ b/cpp/src/cpu_scoring.cpp
+@@ -0,0 +1,81 @@
++#include "chimera/chimera_index.cuh"
++#include "chimera/config.cuh"
++#include "chimera/profiling.hpp"
++#include "chimera_index_internal.cuh"
++#include "rabitqlib/utils/space.hpp"
++#include "cpu_gemv_neon.hpp"
++#include <limits>
++namespace Chimera {
++void chimera_index::compute_full_bit_scores(
++    const int* refined_doc_ids,
++    const int* full_bit_candidate_indices,
++    int num_full_bit_candidates,
++    const float* queries_flat,
++    const QueryState* queries,
++    std::pair<float, int>* full_bit_scores
++) {
++    ProfileRange range(profiling_enabled_, "Chimera/cpu_fullbit", num_full_bit_candidates);
++    const size_t full_bit_codes_stride = PADDED_DIM * (1 + ex_bits) / 8;
++    const char* full_bit_codes = mapped_full_bit_data_ != nullptr
++        ? mapped_full_bit_data_ : full_bit_codes_.data();
++    const auto& full_bit_factors = full_bit_factors_;
++    alignas(64) float cbex_sumq_arr[Q_DOCLEN];
++    for (size_t j = 0; j < Q_DOCLEN; j++)
++        cbex_sumq_arr[j] = queries[j].cbex_sumq;
++
++#pragma omp parallel for schedule(dynamic, 1)
++    for (int i = 0; i < num_full_bit_candidates; ++i) {
++        int doc_id = refined_doc_ids[full_bit_candidate_indices[i]];
++        size_t doc_start = doc_ptrs_[doc_id];
++        size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
++
++        alignas(64) float decoded[PADDED_DIM];
++        alignas(64) float full_ip[Q_DOCLEN];
++        alignas(64) float max_ts[Q_DOCLEN];
++        __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
++        for (size_t j = 0; j < Q_DOCLEN; j += 16)
++            _mm512_store_ps(&max_ts[j], neg_inf);
++
++        for (size_t t = 0; t < n_tok; t++) {
++            size_t tid = doc_start + t;
++            unpack_func_(
++                reinterpret_cast<const uint8_t*>(
++                    &full_bit_codes[tid * full_bit_codes_stride]),
++                decoded, PADDED_DIM);
++            if (t + 1 < n_tok) {
++                __builtin_prefetch(
++                    &full_bit_codes[(tid + 1) * full_bit_codes_stride], 0, 3);
++                __builtin_prefetch(&full_bit_factors[tid + 1], 0, 1);
++            }
++#if defined(__aarch64__)
++            rabitqlib::gemv_batch4_neon(
++#else
++            rabitqlib::gemv_batch8_avx512(
++#endif
++                queries_flat, decoded,
++                full_ip,
++                Q_DOCLEN, PADDED_DIM);
++
++            const float full_bit_factor = full_bit_factors[tid];
++            const __m512 full_bit_factor_vector =
++                _mm512_set1_ps(full_bit_factor);
++
++            for (size_t j = 0; j < Q_DOCLEN; j += 16) {
++                __m512 full_ip_v = _mm512_load_ps(&full_ip[j]);
++                __m512 cbex    = _mm512_load_ps(&cbex_sumq_arr[j]);
++                __m512 combined = _mm512_mul_ps(
++                    _mm512_sub_ps(full_ip_v, cbex),
++                    full_bit_factor_vector);
++                _mm512_store_ps(&max_ts[j],
++                    _mm512_max_ps(_mm512_load_ps(&max_ts[j]), combined));
++            }
++        }
++
++        __m512 sum = _mm512_load_ps(&max_ts[0]);
++        for (size_t j = 16; j < Q_DOCLEN; j += 16)
++            sum = _mm512_add_ps(sum, _mm512_load_ps(&max_ts[j]));
++        full_bit_scores[i] = {_mm512_reduce_add_ps(sum), doc_id};
++    }
++}
++
++} // namespace Chimera
+--- a/cpp/src/fp16_input.cpp
++++ b/cpp/src/fp16_input.cpp
+@@ -0,0 +1,66 @@
++#include "chimera/fp16_input.hpp"
++#include <limits>
++#if defined(__aarch64__)
++#include <arm_neon.h>
++#endif
++
++namespace Chimera {
++namespace {
++uint32_t scalar_bits(uint16_t input) noexcept {
++    const uint32_t sign = static_cast<uint32_t>(input & 0x8000u) << 16;
++    const uint32_t exponent = (input >> 10) & 31u;
++    uint32_t mantissa = input & 1023u;
++    if (exponent == 31) {
++        return sign | 0x7f800000u | (mantissa << 13) |
++               (mantissa != 0 ? 0x00400000u : 0u);
++    }
++    if (exponent != 0) return sign | ((exponent + 112u) << 23) | (mantissa << 13);
++    if (mantissa == 0) return sign;
++    int shift = 0;
++    while ((mantissa & 1024u) == 0) { mantissa <<= 1; ++shift; }
++    return sign | (static_cast<uint32_t>(113 - shift) << 23) | ((mantissa & 1023u) << 13);
++}
++}
++
++bool expand_fp16_to_fp32(const uint16_t* source, float* destination,
++                         size_t count) noexcept {
++    static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
++                  "Input conversion requires IEEE binary32");
++    size_t i = 0;
++    bool finite = true;
++#if defined(__aarch64__)
++    const uint32x4_t zero = vdupq_n_u32(0);
++    const uint32x4_t mask = vdupq_n_u32(1023u);
++    uint32x4_t invalid = zero;
++    for (; i + 4 <= count; i += 4) {
++        const uint32x4_t input = vmovl_u16(vld1_u16(source + i));
++        const uint32x4_t sign = vshlq_n_u32(vandq_u32(input, vdupq_n_u32(0x8000u)), 16);
++        const uint32x4_t exponent = vandq_u32(vshrq_n_u32(input, 10), vdupq_n_u32(31u));
++        const uint32x4_t mantissa = vandq_u32(input, mask);
++        const uint32x4_t normal = vorrq_u32(vshlq_n_u32(vaddq_u32(exponent, vdupq_n_u32(112u)), 23),
++                                           vshlq_n_u32(mantissa, 13));
++        const uint32x4_t shift = vsubq_u32(vclzq_u32(mantissa), vdupq_n_u32(21u));
++        uint32x4_t subnormal = vorrq_u32(
++            vshlq_n_u32(vsubq_u32(vdupq_n_u32(113u), shift), 23),
++            vshlq_n_u32(vandq_u32(vshlq_u32(mantissa, vreinterpretq_s32_u32(shift)), mask), 13));
++        subnormal = vbslq_u32(vceqq_u32(mantissa, zero), zero, subnormal);
++        const uint32x4_t quiet = vandq_u32(vmvnq_u32(vceqq_u32(mantissa, zero)), vdupq_n_u32(0x00400000u));
++        const uint32x4_t special = vorrq_u32(vdupq_n_u32(0x7f800000u),
++                                           vorrq_u32(vshlq_n_u32(mantissa, 13), quiet));
++        uint32x4_t result = vbslq_u32(vceqq_u32(exponent, zero), subnormal, normal);
++        const uint32x4_t is_special = vceqq_u32(exponent, vdupq_n_u32(31u));
++        result = vorrq_u32(sign, vbslq_u32(is_special, special, result));
++        vst1q_f32(destination + i, vreinterpretq_f32_u32(result));
++        invalid = vorrq_u32(invalid, is_special);
++    }
++    finite = vmaxvq_u32(invalid) == 0;
++#endif
++    for (; i < count; ++i) {
++        const uint32_t bits = scalar_bits(source[i]);
++        std::memcpy(destination + i, &bits, sizeof(bits));
++        finite = finite && ((source[i] & 0x7c00u) != 0x7c00u);
++    }
++    return finite;
++}
++
++}  // namespace Chimera
+--- a/cpp/src/search_impl.cu
++++ b/cpp/src/search_impl.cu
+@@ -9,6 +9,7 @@
+ #define EIGEN_NO_CUDA
+ 
+ #include "chimera/config.cuh"
++#include "chimera/profiling.hpp"
+ #include "chimera/ivf_pg.hpp"
+ #include "chimera/kernels.cuh"
+ #include "chimera_index_internal.cuh"
+@@ -16,7 +17,7 @@
+ #include "rabitqlib/utils/space.hpp"
+ 
+ #include <algorithm>
+-#include <immintrin.h>
++#include "rabitqlib/utils/chimera_simd.hpp"
+ #include <limits>
+ #include <numeric>
+ #include <queue>
+@@ -120,6 +121,7 @@
+     size_t k_refine,
+     int& num_refined_candidates,
+     cudaStream_t stream) {
++    ProfileRange range(profiling_enabled_, "Chimera/candidate_generation_refinement");
+     check_cuda(cudaMemsetAsync(d_candidate_bitmap_, 0,
+                                candidate_bitmap_bucket_count_ * sizeof(candidate_bitmap_bucket_t),
+                                ws_->stream_d2h));
+@@ -128,6 +130,8 @@
+                                ws_->stream_d2h));
+     check_cuda(cudaEventRecord(ws_->event_h2d_done, ws_->stream_d2h));
+ 
++    {
++    ProfileRange route(profiling_enabled_, "Chimera/route");
+     ivf->search_centroids(
+         *cagra_res_,
+         ws_->d_queries,
+@@ -137,6 +141,7 @@
+         ws_->d_cagra_labels,
+         stream,
+         static_cast<size_t>(options_.cagra_itopk_size));
++    }
+ 
+     check_cuda(cudaStreamWaitEvent(stream, ws_->event_h2d_done));
+ 
+@@ -268,6 +273,7 @@
+     QueryState* queries,
+     std::vector<size_t>& result
+ ) {
++    ProfileRange range(profiling_enabled_, "Chimera/collaborative_scoring", num_refined_candidates);
+     if (num_refined_candidates == 0) return;
+ 
+     cudaStream_t stream = ws_->stream_compute;
+@@ -353,6 +359,7 @@
+     }
+ 
+     auto launch_chunk_compute = [&](int chunk) {
++        ProfileRange gpu_range(profiling_enabled_, "Chimera/gpu_chunk_submission", chunk);
+         const int chunk_start = chunk * chunk_size;
+         const int chunk_end = std::min(
+             chunk_start + chunk_size, num_refined_candidates);
+@@ -421,7 +428,10 @@
+         const int chunk_end = std::min(
+             chunk_start + chunk_size, num_refined_candidates);
+         const int chunk_count = chunk_end - chunk_start;
+-        check_cuda(cudaEventSynchronize(chunk_d2h_done[chunk]));
++        {
++            ProfileRange wait(profiling_enabled_, "Chimera/wait_chunk", chunk);
++            check_cuda(cudaEventSynchronize(chunk_d2h_done[chunk]));
++        }
+ 
+         std::iota(
+             one_bit_score_order.begin() + previous_order_size,
+@@ -494,8 +504,11 @@
+     }
+ 
+     result.clear();
++    last_result_scores_.clear();
++    if (capture_scores_) last_result_scores_.reserve(k);
+     for (size_t i = 0; i < k && !full_bit_result_heap.empty(); ++i) {
+         result.push_back(full_bit_result_heap.top().second);
++        if (capture_scores_) last_result_scores_.push_back(full_bit_result_heap.top().first);
+         full_bit_result_heap.pop();
+     }
+ 
+@@ -507,70 +520,5 @@
+     }
+ }
+ 
+-void chimera_index::compute_full_bit_scores(
+-    const int* refined_doc_ids,
+-    const int* full_bit_candidate_indices,
+-    int num_full_bit_candidates,
+-    const float* queries_flat,
+-    const QueryState* queries,
+-    std::pair<float, int>* full_bit_scores
+-) {
+-    const size_t full_bit_codes_stride = PADDED_DIM * (1 + ex_bits) / 8;
+-    const auto& full_bit_codes = full_bit_codes_;
+-    const auto& full_bit_factors = full_bit_factors_;
+-    alignas(64) float cbex_sumq_arr[Q_DOCLEN];
+-    for (size_t j = 0; j < Q_DOCLEN; j++)
+-        cbex_sumq_arr[j] = queries[j].cbex_sumq;
+-
+-#pragma omp parallel for schedule(dynamic, 1)
+-    for (int i = 0; i < num_full_bit_candidates; ++i) {
+-        int doc_id = refined_doc_ids[full_bit_candidate_indices[i]];
+-        size_t doc_start = doc_ptrs_[doc_id];
+-        size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
+-
+-        alignas(64) float decoded[PADDED_DIM];
+-        alignas(64) float full_ip[Q_DOCLEN];
+-        alignas(64) float max_ts[Q_DOCLEN];
+-        __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+-        for (size_t j = 0; j < Q_DOCLEN; j += 16)
+-            _mm512_store_ps(&max_ts[j], neg_inf);
+-
+-        for (size_t t = 0; t < n_tok; t++) {
+-            size_t tid = doc_start + t;
+-            unpack_func_(
+-                reinterpret_cast<const uint8_t*>(
+-                    &full_bit_codes[tid * full_bit_codes_stride]),
+-                decoded, PADDED_DIM);
+-            if (t + 1 < n_tok) {
+-                __builtin_prefetch(
+-                    &full_bit_codes[(tid + 1) * full_bit_codes_stride], 0, 3);
+-                __builtin_prefetch(&full_bit_factors[tid + 1], 0, 1);
+-            }
+-            rabitqlib::gemv_batch8_avx512(
+-                queries_flat, decoded,
+-                full_ip,
+-                Q_DOCLEN, PADDED_DIM);
+-
+-            const float full_bit_factor = full_bit_factors[tid];
+-            const __m512 full_bit_factor_vector =
+-                _mm512_set1_ps(full_bit_factor);
+-
+-            for (size_t j = 0; j < Q_DOCLEN; j += 16) {
+-                __m512 full_ip_v = _mm512_load_ps(&full_ip[j]);
+-                __m512 cbex    = _mm512_load_ps(&cbex_sumq_arr[j]);
+-                __m512 combined = _mm512_mul_ps(
+-                    _mm512_sub_ps(full_ip_v, cbex),
+-                    full_bit_factor_vector);
+-                _mm512_store_ps(&max_ts[j],
+-                    _mm512_max_ps(_mm512_load_ps(&max_ts[j]), combined));
+-            }
+-        }
+-
+-        __m512 sum = _mm512_load_ps(&max_ts[0]);
+-        for (size_t j = 16; j < Q_DOCLEN; j += 16)
+-            sum = _mm512_add_ps(sum, _mm512_load_ps(&max_ts[j]));
+-        full_bit_scores[i] = {_mm512_reduce_add_ps(sum), doc_id};
+-    }
+-}
+ 
+ }  // namespace Chimera
+--- a/cpp/src/utils.cu
++++ b/cpp/src/utils.cu
+@@ -11,6 +11,7 @@
+ #include "chimera/config.cuh"
+ #include "chimera/ivf_pg.hpp"
+ #include "chimera/kernels.cuh"
++#include "chimera/index_file_io.hpp"
+ #include "chimera_index_internal.cuh"
+ #include "rabitqlib/utils/rotator.hpp"
+ 
+@@ -532,6 +533,11 @@
+     d_clustered_doc_ids_ = nullptr;
+     d_token_to_cluster_pos_ = nullptr;
+ 
++    mapped_full_bit_data_ = nullptr;
++    mapped_full_bit_codes_.reset();
++    low_memory_load_ = false;
++    load_options_ = LoadOptions {};
++    load_directory_.clear();
+     full_bit_codes_.clear();
+     full_bit_factors_.clear();
+     one_bit_codes_.clear();
+--- a/cpp/third_party/rabitqlib/quantization/pack_excode.hpp
++++ b/cpp/third_party/rabitqlib/quantization/pack_excode.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+ 
+-#include <immintrin.h>
++#include "rabitqlib/utils/chimera_simd.hpp"
+ #include <omp.h>
+ 
+ #include <cmath>
+@@ -11,7 +11,7 @@
+ 
+ namespace rabitqlib::quant::rabitq_impl::ex_bits {
+ inline void packing_1bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     // ! require dim % 16 == 0
+     for (size_t j = 0; j < dim; j += 16) {
+         uint16_t code = 0;
+@@ -30,7 +30,7 @@
+ }
+ 
+ inline void packing_2bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     // ! require dim % 16 == 0
+     for (size_t j = 0; j < dim; j += 16) {
+         // pack 16 2-bit codes into int32
+@@ -54,7 +54,7 @@
+ }
+ 
+ inline void packing_3bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     // ! require dim % 64 == 0
+     const __m128i mask = _mm_set1_epi8(0b11);
+     for (size_t d = 0; d < dim; d += 64) {
+@@ -104,7 +104,7 @@
+ inline void packing_4bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+ // although this part only requries SSE, computing inner product for this orgnization
+ // requires AVX512F, similar for remaining functions
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     // ! require dim % 16 == 0
+     for (size_t j = 0; j < dim; j += 16) {
+         // pack 16 4-bit codes into uint64
+@@ -127,7 +127,7 @@
+ }
+ 
+ inline void packing_5bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     // ! require dim % 64 == 0
+     const __m128i mask = _mm_set1_epi8(0b1111);
+     for (size_t j = 0; j < dim; j += 64) {
+@@ -172,7 +172,7 @@
+ }
+ 
+ inline void packing_6bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     constexpr int64_t kMask4 = 0x0f0f0f0f0f0f0f0f;
+     constexpr int32_t kMask2 = 0x30303030;
+     for (size_t j = 0; j < dim; j += 16) {
+@@ -205,7 +205,7 @@
+ }
+ 
+ inline void packing_7bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     // for vec00 to vec47, split code into 6 + 1
+     // for vec48 to vec63, split code into 2 + 2 + 2 + 1
+     const __m128i mask2 = _mm_set1_epi8(0b11000000);
+--- a/cpp/third_party/rabitqlib/utils/chimera_simd.hpp
++++ b/cpp/third_party/rabitqlib/utils/chimera_simd.hpp
+@@ -0,0 +1,38 @@
++#pragma once
++#if defined(__aarch64__)
++#if defined(__CUDACC__)
++#define SIMDE_NO_NATIVE
++#endif
++#define SIMDE_ENABLE_NATIVE_ALIASES
++#include "simde-0.8.2/simde/x86/avx512.h"
++
++inline __mmask16 _cvtu32_mask16(uint32_t v) { return static_cast<__mmask16>(v); }
++inline __m512i _mm512_cvtepu8_epi32(__m128i a) {
++    const auto x=simde__m128i_to_private(a); simde__m512i_private y;
++    for(int i=0;i<16;++i) y.i32[i]=x.u8[i]; return simde__m512i_from_private(y);
++}
++inline __m512i _mm512_cvtepi8_epi32(__m128i a) {
++    const auto x=simde__m128i_to_private(a); simde__m512i_private y;
++    for(int i=0;i<16;++i) y.i32[i]=x.i8[i]; return simde__m512i_from_private(y);
++}
++inline __m128i _mm512_cvtepi32_epi8(__m512i a) {
++    const auto x=simde__m512i_to_private(a); simde__m128i_private y;
++    for(int i=0;i<16;++i) y.u8[i]=static_cast<uint8_t>(x.i32[i]); return simde__m128i_from_private(y);
++}
++inline __m256i _mm512_cvtepi32_epi16(__m512i a) {
++    const auto x=simde__m512i_to_private(a); simde__m256i_private y;
++    for(int i=0;i<16;++i) y.u16[i]=static_cast<uint16_t>(x.i32[i]); return simde__m256i_from_private(y);
++}
++inline void _mm_storeu_epi8(void* p, __m128i a) {simde_mm_storeu_si128(p,a);}
++inline float _mm512_reduce_add_ps(__m512 a) {
++    const auto x=simde__m512_to_private(a);
++    // AVX512 reduction tree: 512->256->128->64->32.
++    float q[8]; for(int i=0;i<8;++i) q[i]=x.f32[i]+x.f32[i+8];
++    float r[4]; for(int i=0;i<4;++i) r[i]=q[i]+q[i+4];
++    return (r[0]+r[2])+(r[1]+r[3]);
++}
++
++#define CHIMERA_SIMDE_AVX512 1
++#else
++#include <immintrin.h>
++#endif
+--- a/cpp/third_party/rabitqlib/utils/fht_avx.cpp
++++ b/cpp/third_party/rabitqlib/utils/fht_avx.cpp
+@@ -1,3 +1,138 @@
++#if defined(__aarch64__)
++#include <cstddef>
++template<class T> static void chimera_fht_portable(T* buf, int log_n) {
++    const size_t n = size_t{1} << log_n;
++    for (size_t half = 1; half < n; half *= 2)
++        for (size_t base = 0; base < n; base += 2 * half)
++            for (size_t j = 0; j < half; ++j) {
++                const T u = buf[base+j], v = buf[base+j+half];
++                buf[base+j] = u + v;
++                buf[base+j+half] = u - v;
++            }
++}
++void helper_float_1(float* buf) { chimera_fht_portable(buf, 1); }
++void helper_float_1_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_2(float* buf) { chimera_fht_portable(buf, 2); }
++void helper_float_2_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_3(float* buf) { chimera_fht_portable(buf, 3); }
++void helper_float_3_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_4(float* buf) { chimera_fht_portable(buf, 4); }
++void helper_float_4_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_5(float* buf) { chimera_fht_portable(buf, 5); }
++void helper_float_5_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_6(float* buf) { chimera_fht_portable(buf, 6); }
++void helper_float_6_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_7(float* buf) { chimera_fht_portable(buf, 7); }
++void helper_float_7_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_8(float* buf) { chimera_fht_portable(buf, 8); }
++void helper_float_8_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_9(float* buf) { chimera_fht_portable(buf, 9); }
++void helper_float_9_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_10(float* buf) { chimera_fht_portable(buf, 10); }
++void helper_float_10_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_11(float* buf) { chimera_fht_portable(buf, 11); }
++void helper_float_11_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_12(float* buf) { chimera_fht_portable(buf, 12); }
++void helper_float_12_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_13(float* buf) { chimera_fht_portable(buf, 13); }
++void helper_float_13_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_14(float* buf) { chimera_fht_portable(buf, 14); }
++void helper_float_14_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_15(float* buf) { chimera_fht_portable(buf, 15); }
++void helper_float_15_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_16(float* buf) { chimera_fht_portable(buf, 16); }
++void helper_float_16_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_17(float* buf) { chimera_fht_portable(buf, 17); }
++void helper_float_17_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_18(float* buf) { chimera_fht_portable(buf, 18); }
++void helper_float_18_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_19(float* buf) { chimera_fht_portable(buf, 19); }
++void helper_float_19_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_20(float* buf) { chimera_fht_portable(buf, 20); }
++void helper_float_20_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_21(float* buf) { chimera_fht_portable(buf, 21); }
++void helper_float_21_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_22(float* buf) { chimera_fht_portable(buf, 22); }
++void helper_float_22_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_23(float* buf) { chimera_fht_portable(buf, 23); }
++void helper_float_23_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_24(float* buf) { chimera_fht_portable(buf, 24); }
++void helper_float_24_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_25(float* buf) { chimera_fht_portable(buf, 25); }
++void helper_float_25_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_26(float* buf) { chimera_fht_portable(buf, 26); }
++void helper_float_26_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_27(float* buf) { chimera_fht_portable(buf, 27); }
++void helper_float_27_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_28(float* buf) { chimera_fht_portable(buf, 28); }
++void helper_float_28_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_29(float* buf) { chimera_fht_portable(buf, 29); }
++void helper_float_29_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_30(float* buf) { chimera_fht_portable(buf, 30); }
++void helper_float_30_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++int fht_float(float* buf, int log_n) { if(log_n < 0 || log_n > 30) return -1; chimera_fht_portable(buf, log_n); return 0; }
++void helper_double_1(double* buf) { chimera_fht_portable(buf, 1); }
++void helper_double_1_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_2(double* buf) { chimera_fht_portable(buf, 2); }
++void helper_double_2_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_3(double* buf) { chimera_fht_portable(buf, 3); }
++void helper_double_3_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_4(double* buf) { chimera_fht_portable(buf, 4); }
++void helper_double_4_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_5(double* buf) { chimera_fht_portable(buf, 5); }
++void helper_double_5_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_6(double* buf) { chimera_fht_portable(buf, 6); }
++void helper_double_6_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_7(double* buf) { chimera_fht_portable(buf, 7); }
++void helper_double_7_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_8(double* buf) { chimera_fht_portable(buf, 8); }
++void helper_double_8_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_9(double* buf) { chimera_fht_portable(buf, 9); }
++void helper_double_9_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_10(double* buf) { chimera_fht_portable(buf, 10); }
++void helper_double_10_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_11(double* buf) { chimera_fht_portable(buf, 11); }
++void helper_double_11_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_12(double* buf) { chimera_fht_portable(buf, 12); }
++void helper_double_12_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_13(double* buf) { chimera_fht_portable(buf, 13); }
++void helper_double_13_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_14(double* buf) { chimera_fht_portable(buf, 14); }
++void helper_double_14_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_15(double* buf) { chimera_fht_portable(buf, 15); }
++void helper_double_15_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_16(double* buf) { chimera_fht_portable(buf, 16); }
++void helper_double_16_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_17(double* buf) { chimera_fht_portable(buf, 17); }
++void helper_double_17_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_18(double* buf) { chimera_fht_portable(buf, 18); }
++void helper_double_18_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_19(double* buf) { chimera_fht_portable(buf, 19); }
++void helper_double_19_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_20(double* buf) { chimera_fht_portable(buf, 20); }
++void helper_double_20_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_21(double* buf) { chimera_fht_portable(buf, 21); }
++void helper_double_21_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_22(double* buf) { chimera_fht_portable(buf, 22); }
++void helper_double_22_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_23(double* buf) { chimera_fht_portable(buf, 23); }
++void helper_double_23_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_24(double* buf) { chimera_fht_portable(buf, 24); }
++void helper_double_24_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_25(double* buf) { chimera_fht_portable(buf, 25); }
++void helper_double_25_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_26(double* buf) { chimera_fht_portable(buf, 26); }
++void helper_double_26_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_27(double* buf) { chimera_fht_portable(buf, 27); }
++void helper_double_27_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_28(double* buf) { chimera_fht_portable(buf, 28); }
++void helper_double_28_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_29(double* buf) { chimera_fht_portable(buf, 29); }
++void helper_double_29_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_30(double* buf) { chimera_fht_portable(buf, 30); }
++void helper_double_30_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++int fht_double(double* buf, int log_n) { if(log_n < 0 || log_n > 30) return -1; chimera_fht_portable(buf, log_n); return 0; }
++#else
+ #include "rabitqlib/utils/fht_avx.hpp"
+ 
+ // https://github.com/FALCONN-LIB/FFHT
+@@ -19595,3 +19730,5 @@
+   }
+   return 1;
+ }
++
++#endif
+--- a/cpp/third_party/rabitqlib/utils/space.hpp
++++ b/cpp/third_party/rabitqlib/utils/space.hpp
+@@ -1,7 +1,6 @@
+ #pragma once
+ 
+-#include <emmintrin.h>
+-#include <immintrin.h>
++#include "rabitqlib/utils/chimera_simd.hpp"
+ #include <omp.h>
+ 
+ #include <cassert>
+@@ -51,7 +50,7 @@
+     float lo,
+     float delta
+ ) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     size_t mul16 = dim - (dim & 0b1111);
+     size_t i = 0;
+     float one_over_delta = 1 / delta;
+@@ -79,7 +78,7 @@
+     float lo,
+     float delta
+ ) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     size_t mul16 = dim - (dim & 0b1111);
+     size_t i = 0;
+     float one_over_delta = 1 / delta;

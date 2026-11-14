@@ -8,9 +8,9 @@
 
 蓝色为CPU步骤，绿色为GPU，橙色箭头为数据传输；**W1–W4表示CPU必须确认GPU结果可用后才能继续。** 图中编号对应实际kernel调用顺序。
 
-![Chimera+单query流程](../report-assets/chimera-plus-query-flow.png)
+![Chimera+单query流程](figures/chimera-plus-query-flow.png)
 
-[放大矢量流程图](../report-assets/chimera-plus-query-flow.svg)
+[放大矢量流程图](figures/chimera-plus-query-flow.svg)
 
 ## 候选规模怎么收缩？
 
@@ -31,7 +31,7 @@
 
 下面是同一条查询的实测轨迹，横轴为毫秒。GPU行上的编号对应流程图；短kernel很多，因此只在较宽的条上标号。
 
-![实际query时间轴](../report-assets/chimera-plus-query-timeline.png)
+![实际query时间轴](figures/chimera-plus-query-timeline.png)
 
 **当前GPU计算stream按序执行，查询之间无流水线。** H2D、D2H和部分清零可以在独立stream中异步执行。W1–W4共对应3次`cudaStreamSynchronize`和1次`cudaEventSynchronize`；部分传输API本身也可能阻塞CPU。
 
@@ -75,9 +75,9 @@
 
 ## 对应实现与证据
 
-- [查询调度与候选/1bit评分源码](/home/lxq/multi-query/Chimera/cpp/src/search_impl.cu)
-- [GPU完整4bit精排源码](/home/lxq/multi-query/Chimera/cpp/src/gpu_fullbit_scoring.cu)
-- [实测全流程汇总与24次kernel记录](../systems/chimera-plus/profile-r100-p95/flow-summary.json)
+- [查询调度与候选/1bit评分源码](/home/lxq/multi-vector-research/Chimera/cpp/src/search_impl.cu)
+- [GPU完整4bit精排源码](/home/lxq/multi-vector-research/Chimera/cpp/src/gpu_fullbit_scoring.cu)
+- [实测全流程汇总与24次kernel记录](../local/legacy-systems/chimera-plus/profile-r100-p95/flow-summary.json)
 - [两系统及Chimera+的性能报告](lotte-r10-brief.md)
 
 源码分支`Chimera+`，提交`c97f24c`；图来自已采集的NSYS轨迹，本次没有新增GPU测试。

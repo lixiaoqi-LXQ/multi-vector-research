@@ -1,0 +1,47 @@
+# This file may be used to create an environment using:
+# $ conda create --name <env> --file <this file>
+# platform: linux-aarch64
+# created-by: conda 26.1.1
+@EXPLICIT
+https://conda.anaconda.org/conda-forge/noarch/arm-variant-1.2.0-sbsa.conda
+https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.10.23-hbd8a1cb_0.conda
+https://conda.anaconda.org/conda-forge/noarch/cuda-version-13.5-h3499c3b_3.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libgomp-16.2.0-h8acb6b2_7.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libzlib-1.3.2-hdc9db2a_3.conda
+https://conda.anaconda.org/conda-forge/noarch/python_abi-3.13-9_cp313.conda
+https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
+https://conda.anaconda.org/conda-forge/noarch/cuda-cudart_linux-aarch64-13.5.37-hf3a43d7_0.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/zstd-1.5.7-h9d15635_7.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/ld_impl_linux-aarch64-2.46.1-default_h1979696_103.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libgcc-16.2.0-h205dda4_7.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/bzip2-1.0.8-h4777abc_10.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libexpat-2.9.0-h4154aff_0.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libffi-3.7.0-hdaad0be_1.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libgfortran5-16.2.0-hc864f27_7.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/liblzma-5.8.3-he30d5cf_1.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libmpdec-4.0.0-he30d5cf_2.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libpython-3.13.18-h150030a_100_cp313.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libsqlite-3.54.1-hd26f1b6_101.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libstdcxx-16.2.0-hef695bb_7.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libuuid-2.42.4-hd6fdeab_1.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/ncurses-6.6-h2b6f883_1.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/openssl-3.6.5-he6ad1d5_0.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/tk-8.6.13-noxft_hf03c496_4.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/cuda-cudart-13.5.37-hc1d3098_0.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/cuda-nvrtc-13.5.37-hc1d3098_0.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libcurand-10.4.5.25-hc1d3098_0.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libgfortran-16.2.0-he9431aa_7.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/readline-8.3-ha7194a6_1.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libcublas-13.10.0.20-hc1d3098_0.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libopenblas-0.3.34-pthreads_h4148b7d_2.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/python-3.13.18-hd0fdf85_100_cp313.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libblas-3.11.0-12_haddc8a3_openblas.conda
+https://conda.anaconda.org/conda-forge/noarch/packaging-26.3-pyhc364b38_0.conda
+https://conda.anaconda.org/conda-forge/noarch/pip-26.2.2-pyh145f28c_2.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libcblas-3.11.0-12_hd72aa62_openblas.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/liblapack-3.11.0-12_h88aeb00_openblas.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/libfaiss-1.14.3-cuda130hbb8ec81_201_cuda.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/numpy-2.5.4-py313h6bbad23_0.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/faiss-1.14.3-py313cuda130he45fd38_201_cuda.conda
+https://conda.anaconda.org/conda-forge/linux-aarch64/faiss-gpu-1.14.3-h657638e_201.conda

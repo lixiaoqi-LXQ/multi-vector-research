@@ -45,7 +45,7 @@ Chimera与Chimera+使用相同参数，顺序为`nprobe / k_refine / k_full_bit 
 | Chimera+ | 0.95 | 0.958581 | 807.56 | 1.238 | 1.660 |
 | PLAID（官方GPU） | 0.95 | 0.956534 | 44.89 | 22.278 | 31.604 |
 
-![R10端到端QPS与平均/P99延迟](../report-assets/lotte-throughput.png)
+![R10端到端QPS与平均/P99延迟](figures/lotte-throughput.png)
 
 每点全2,931条查询×3轮，参数不重选。平均延迟、QPS及P99分别取三轮均值，误差线为三轮范围。原Chimera结果来自前批正式测试，Chimera+为本轮同参测试。
 
@@ -71,7 +71,7 @@ Chimera与Chimera+使用相同参数，顺序为`nprobe / k_refine / k_full_bit 
 | Chimera+ | 0.95 | 0.952856 | 359.85 | 2.779 | 3.546 |
 | PLAID（官方GPU） | 0.95 | 0.951648 | 36.78 | 27.188 | 37.710 |
 
-![R100端到端QPS与平均/P99延迟](../report-assets/lotte-throughput-r100.png)
+![R100端到端QPS与平均/P99延迟](figures/lotte-throughput-r100.png)
 
 ## Chimera+：R100 0.95全流程GPU利用与带宽
 
@@ -91,7 +91,7 @@ Chimera与Chimera+使用相同参数，顺序为`nprobe / k_refine / k_full_bit 
 
 32条正常查询区间内，GPU活跃平均94.6%、SM活跃85.7%、SM指令发射14.1%。这些是全流程采样；上表吞吐是单条完整查询的计数估算，正式QPS仍使用前面的全量三轮结果。
 
-![全流程GPU运算与L2请求分布](../report-assets/lotte-gpu-profile.png)
+![全流程GPU运算与L2请求分布](figures/lotte-gpu-profile.png)
 
 **路由和候选阶段占据大量L2流量，只测精排会明显低估全流程。** GPU精排仅约6.3MB L2请求，而整条查询约969.6MB。
 
@@ -103,11 +103,11 @@ L2请求带宽不是LPDDR总线带宽。读取未命中估算未包含写回，�
 <summary>全流程采集命令与原始计数</summary>
 
 ```sh
-/usr/local/cuda/bin/ncu --target-processes all --profile-from-start off --launch-count 24 --cache-control none --disable-extra-suffixes --metrics gpu__time_duration.sum,lts__t_bytes.sum,smsp__sass_thread_inst_executed_op_ffma_pred_on.sum,smsp__sass_thread_inst_executed_op_fadd_pred_on.sum,smsp__sass_thread_inst_executed_op_fmul_pred_on.sum --force-overwrite --export /home/lxq/multi-query/systems/chimera-plus/profile-r100-p95/ncuflow/counters /home/lxq/graduate/.venv/bin/python /home/lxq/multi-query/systems/chimera/profile-v2/leaf_exec.py /home/lxq/multi-query/systems/chimera-plus/profile-r100-p95/ncuflow/tree-config.json
+/usr/local/cuda/bin/ncu --target-processes all --profile-from-start off --launch-count 24 --cache-control none --disable-extra-suffixes --metrics gpu__time_duration.sum,lts__t_bytes.sum,smsp__sass_thread_inst_executed_op_ffma_pred_on.sum,smsp__sass_thread_inst_executed_op_fadd_pred_on.sum,smsp__sass_thread_inst_executed_op_fmul_pred_on.sum --force-overwrite --export /home/lxq/multi-vector-research/systems/chimera-plus/profile-r100-p95/ncuflow/counters /home/lxq/graduate/.venv/bin/python /home/lxq/multi-vector-research/systems/chimera/profile-v2/leaf_exec.py /home/lxq/multi-vector-research/systems/chimera-plus/profile-r100-p95/ncuflow/tree-config.json
 ```
 
 ```sh
-/usr/local/cuda/bin/ncu --target-processes all --profile-from-start off --launch-count 24 --cache-control none --disable-extra-suffixes --metrics gpu__time_duration.sum,lts__t_bytes.sum,lts__t_sectors_op_read_lookup_miss.sum,lts__t_sectors_aperture_sysmem_op_read_lookup_miss.sum,lts__t_sectors_op_write.sum --force-overwrite --export /home/lxq/multi-query/systems/chimera-plus/profile-r100-p95/memflow/counters /home/lxq/graduate/.venv/bin/python /home/lxq/multi-query/systems/chimera/profile-v2/leaf_exec.py /home/lxq/multi-query/systems/chimera-plus/profile-r100-p95/memflow/tree-config.json
+/usr/local/cuda/bin/ncu --target-processes all --profile-from-start off --launch-count 24 --cache-control none --disable-extra-suffixes --metrics gpu__time_duration.sum,lts__t_bytes.sum,lts__t_sectors_op_read_lookup_miss.sum,lts__t_sectors_aperture_sysmem_op_read_lookup_miss.sum,lts__t_sectors_op_write.sum --force-overwrite --export /home/lxq/multi-vector-research/systems/chimera-plus/profile-r100-p95/memflow/counters /home/lxq/graduate/.venv/bin/python /home/lxq/multi-vector-research/systems/chimera/profile-v2/leaf_exec.py /home/lxq/multi-vector-research/systems/chimera-plus/profile-r100-p95/memflow/tree-config.json
 ```
 
 ```csv
@@ -118,7 +118,7 @@ GPU 1bit scoring,411199496,230414528,63284320
 GPU 4bit scoring,365138860,6327296,29792
 ```
 
-[全24次kernel算术原始CSV](../systems/chimera-plus/profile-r100-p95/ncuflow/raw.csv) · [全24次kernel内存原始CSV](../systems/chimera-plus/profile-r100-p95/memflow/raw.csv) · [全流程汇总与公式](../systems/chimera-plus/profile-r100-p95/flow-summary.json)
+[全24次kernel算术原始CSV](../local/legacy-systems/chimera-plus/profile-r100-p95/ncuflow/raw.csv) · [全24次kernel内存原始CSV](../local/legacy-systems/chimera-plus/profile-r100-p95/memflow/raw.csv) · [全流程汇总与公式](../local/legacy-systems/chimera-plus/profile-r100-p95/flow-summary.json)
 
 </details>
 
@@ -130,7 +130,7 @@ GPU 4bit scoring,365138860,6327296,29792
 
 GPU保留CPU的FP32 FMA和归约顺序。104个合成候选、真实LoTTE四配置的22,780个候选评分（含预热）均与CPU逐位一致。正式计时关闭逐位复查，包含GPU精排、必要传输及完成同步。
 
-项目Git仓库：`/home/lxq/multi-query`；源码位于`Chimera/`，分支`Chimera+`，GPU精排变更提交`c97f24c`。`baseline`分支保留原ARM实验源码历史。
+项目Git仓库：`/home/lxq/multi-vector-research`；源码位于`Chimera/`，分支`Chimera+`，GPU精排变更提交`c97f24c`。`baseline`分支保留原ARM实验源码历史。
 
 ## 原Chimera瓶颈分析：0.90与0.95
 
@@ -151,7 +151,7 @@ GPU保留CPU的FP32 FMA和归约顺序。104个合成候选、真实LoTTE四配�
 | Chimera | 0.95 | query | 1.879 | 1.037 | 0.616 | 0.000 | 0.226 |
 
 
-![两档配置瓶颈](../report-assets/lotte-bottlenecks.png)
+![两档配置瓶颈](figures/lotte-bottlenecks.png)
 
 GPU活动包含kernel、copy、memset；其余区间包含主机整理、提交和等待。统计完整query范围，重叠为0。
 
@@ -175,7 +175,7 @@ GPU活动包含kernel、copy、memset；其余区间包含主机整理、提交�
 | 20 | 0-19 | 2 | 790.76 | 1.265 |
 | 20 | 0-19 | 4 | 544.07 | 1.838 |
 
-![线程与chunks微调](../report-assets/lotte-tuning.png)
+![线程与chunks微调](figures/lotte-tuning.png)
 
 **CPU线程：4个快核短测最快，20线程反而下降。** CPU精排按文档分配任务，使用`OpenMP schedule(dynamic,1)`；此处full目标仅20篇，任务数少，增线程很快遇到并行度上限。更多线程增加任务领取、唤醒及结束屏障开销；文档长度不等还带来尾部等待。20核配置还包含不同性能的CPU核，因此线程数与核类型同时变化。源码支持这些机制，但短测没有分别隔离每项成本；不能据此判定“多核本身更慢”。
 
@@ -192,7 +192,7 @@ GPU活动包含kernel、copy、memset；其余区间包含主机整理、提交�
 | 5（上游默认） | 0.958592 | **339.35** | 332.62–344.66 | 2.947 | 7.206 |
 
 
-![chunks正式性能](../report-assets/lotte-r10-95-chunks.png)
+![chunks正式性能](figures/lotte-r10-95-chunks.png)
 
 | chunks | CPU精排文档/查询 | CPU区域ms/查询 | CPU/GPU重叠ms/查询 |
 |---|---|---:|---:|
@@ -231,6 +231,6 @@ GPU活动包含kernel、copy、memset；其余区间包含主机整理、提交�
 
 ## 数据证据
 
-[Recall@10正式结果](lotte-r10-full-query-records.json) · [0.95选参与chunks明细](lotte-r10-95-chunks-data.json) · [0.90阶段数据](lotte-r10-nsys-stage-projection.json) · [0.95阶段数据](../systems/chimera/profile-v2/r10p95-overlap-v1/E-c1-c4-overlap-breakdown.json) · [Chimera R100结果](../systems/chimera/r100-v1/completion-summary.json) · [PLAID R100结果](../systems/plaid/ai-workspace/r100-native-device-lock-v2/final-acceptance.json) · [线程/chunks短测明细](../systems/chimera/fine-completion-v1/r10-controls-cal-v1/completion-summary.json)
+[Recall@10正式结果](../local/legacy-reports/lotte-r10-full-query-records.json) · [0.95选参与chunks明细](../local/legacy-reports/lotte-r10-95-chunks-data.json) · [0.90阶段数据](../local/legacy-reports/lotte-r10-nsys-stage-projection.json) · [0.95阶段数据](../local/legacy-systems/chimera/profile-v2/r10p95-overlap-v1/E-c1-c4-overlap-breakdown.json) · [Chimera R100结果](../local/legacy-systems/chimera/r100-v1/completion-summary.json) · [PLAID R100结果](../local/legacy-systems/plaid/ai-workspace/r100-native-device-lock-v2/final-acceptance.json) · [线程/chunks短测明细](../local/legacy-systems/chimera/fine-completion-v1/r10-controls-cal-v1/completion-summary.json)
 
-[Chimera+四组正式结果与每轮数据](../systems/chimera-plus/formal-results.json) · [Chimera+源码与二进制身份](../systems/chimera-plus/implementation-identity.json)
+[Chimera+四组正式结果与每轮数据](../local/legacy-systems/chimera-plus/formal-results.json) · [Chimera+源码与二进制身份](../local/legacy-systems/chimera-plus/implementation-identity.json)

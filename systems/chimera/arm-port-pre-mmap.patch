@@ -1,0 +1,603 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -5,7 +5,7 @@
+ set(CMAKE_CUDA_STANDARD 17)
+ set(CMAKE_BUILD_TYPE Release)
+ 
+-add_compile_definitions(LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
++add_compile_definitions(LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE $<$<COMPILE_LANGUAGE:CUDA>:EIGEN_DONT_VECTORIZE>)
+ 
+ if(NOT CHIMERA_TOOLCHAIN_ROOT)
+     set(CHIMERA_TOOLCHAIN_ROOT "")
+@@ -34,10 +34,11 @@
+ endif()
+ 
+ add_compile_options(
+-    -fopenmp
+-    -march=native
+-    -ftree-vectorize
+-    -fexceptions
++    $<$<COMPILE_LANGUAGE:CXX>:-fopenmp>
++    $<$<COMPILE_LANGUAGE:CXX>:-march=native>
++    $<$<COMPILE_LANGUAGE:CXX>:-ftree-vectorize>
++    $<$<COMPILE_LANGUAGE:CXX>:-fexceptions>
++    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fopenmp,-march=native,-ftree-vectorize,-fexceptions>
+     $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=68,177,186>
+ )
+ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets -Wno-deprecated-declarations")
+@@ -56,6 +57,7 @@
+     cpp/src/ivf_pg.cpp
+     cpp/src/kernels.cu
+     cpp/src/quantization.cpp
++    cpp/src/cpu_scoring.cpp
+     cpp/src/search_impl.cu
+     cpp/src/utils.cu
+ )
+--- a/cpp/apps/search.cpp
++++ b/cpp/apps/search.cpp
+@@ -5,6 +5,9 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <iomanip>
++#include <fstream>
++#include <numeric>
++#include <stdexcept>
+ #include <iostream>
+ #include <string>
+ #include <vector>
+@@ -88,6 +91,7 @@
+ 
+     chimera_index index;
+     index.load(args.index_dir, args.options);
++    index.set_capture_scores(!args.output_file.empty());
+ 
+     for (int i = 0; i < warmup_queries; ++i) {
+         index.search(&queries[i * Q_DOCLEN * d], Q_DOCLEN * d, args.k);
+@@ -95,6 +99,8 @@
+ 
+     std::vector<std::vector<size_t>> results(run_queries);
+     std::vector<double> query_latencies_ms(run_queries);
++    std::vector<std::vector<float>> scores(args.output_file.empty() ? 0 : run_queries);
++    const auto loop_start = std::chrono::steady_clock::now();
+     for (int i = 0; i < run_queries; ++i) {
+         const auto query_start = std::chrono::high_resolution_clock::now();
+         results[i] =
+@@ -103,8 +109,24 @@
+         query_latencies_ms[i] =
+             std::chrono::duration<double, std::milli>(
+                 query_end - query_start).count();
++        if (!args.output_file.empty()) scores[i] = index.last_result_scores();
+     }
+ 
++    const double loop_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loop_start).count();
++    if (!args.output_file.empty()) {
++        std::ofstream output(args.output_file);
++        if (!output) throw std::runtime_error("Could not open result output: " + args.output_file);
++        output << "query_id\trank\tdocument_id\tquantized_score\tlatency_ms\n" << std::setprecision(10);
++        for (int i = 0; i < run_queries; ++i)
++            for (size_t j = 0; j < results[i].size(); ++j)
++                output << i << '\t' << j+1 << '\t' << results[i][j] << '\t'
++                       << scores[i][j] << '\t' << query_latencies_ms[i] << '\n';
++        if (!output) throw std::runtime_error("Failed writing result output");
++    }
++    const double total_ms = std::accumulate(query_latencies_ms.begin(), query_latencies_ms.end(), 0.0);
++    std::cout << std::setprecision(10) << "[SEARCH] queries=" << run_queries
++              << " total_search_ms=" << total_ms << " qps=" << run_queries*1000.0/total_ms
++              << " loop_wall_ms=" << loop_ms << " loop_qps=" << run_queries*1000.0/loop_ms << '\n';
+     report_latency(query_latencies_ms);
+     report_recalls(eval_ground_truth, results, args.k);
+ 
+--- a/cpp/apps/utils.cpp
++++ b/cpp/apps/utils.cpp
+@@ -93,7 +93,9 @@
+         if (arg == "--help" || arg == "-h") {
+             throw HelpRequested {};
+         }
+-        if (arg == "--query" || arg == "-q") {
++        if (arg == "--output") {
++            args.output_file = require_value(argc, argv, i, arg);
++        } else if (arg == "--query" || arg == "-q") {
+             args.query_file = require_value(argc, argv, i, arg);
+         } else if (arg == "--gt" || arg == "-g") {
+             args.gt_file = require_value(argc, argv, i, arg);
+@@ -165,6 +167,7 @@
+         << "  --query <query_embeddings.bin>\n"
+         << "  --gt <groundtruth.tsv>\n"
+         << "  --index <index_dir>\n"
++        << "  [--output <results.tsv>]        Write query/rank/doc/quantized_score/latency after measurement.\n"
+         << "  [--k <top_k>]                   Final documents returned. Default: "
+         << defaults.k << "\n"
+         << "  [--nq <num_queries>]            Evaluation queries; -1 means all. Default: "
+--- a/cpp/apps/utils.hpp
++++ b/cpp/apps/utils.hpp
+@@ -23,6 +23,7 @@
+     int k = 100;
+     int nq = -1;
+     int warmup = 5;
++    std::string output_file;
+     std::string query_file;
+     std::string gt_file;
+     std::string index_dir;
+--- a/cpp/include/chimera/chimera_index.cuh
++++ b/cpp/include/chimera/chimera_index.cuh
+@@ -61,6 +61,10 @@
+         size_t query_size,
+         size_t k);
+ 
++    // Optional observation only; disabled for original API callers.
++    void set_capture_scores(bool enabled) { capture_scores_ = enabled; }
++    const std::vector<float>& last_result_scores() const { return last_result_scores_; }
++
+     void save(const std::string& index_dir) const;
+     void load(
+         const std::string& index_dir,
+@@ -114,6 +118,9 @@
+         const QueryState* queries,
+         std::pair<float, int>* full_bit_scores);
+ 
++    bool capture_scores_ = false;
++    std::vector<float> last_result_scores_;
++
+     size_t n = 0;
+     size_t d = 0;
+     size_t n_clusters = 0;
+--- a/cpp/src/cpu_scoring.cpp
++++ b/cpp/src/cpu_scoring.cpp
+@@ -0,0 +1,73 @@
++#include "chimera/chimera_index.cuh"
++#include "chimera/config.cuh"
++#include "chimera_index_internal.cuh"
++#include "rabitqlib/utils/space.hpp"
++#include <limits>
++namespace Chimera {
++void chimera_index::compute_full_bit_scores(
++    const int* refined_doc_ids,
++    const int* full_bit_candidate_indices,
++    int num_full_bit_candidates,
++    const float* queries_flat,
++    const QueryState* queries,
++    std::pair<float, int>* full_bit_scores
++) {
++    const size_t full_bit_codes_stride = PADDED_DIM * (1 + ex_bits) / 8;
++    const auto& full_bit_codes = full_bit_codes_;
++    const auto& full_bit_factors = full_bit_factors_;
++    alignas(64) float cbex_sumq_arr[Q_DOCLEN];
++    for (size_t j = 0; j < Q_DOCLEN; j++)
++        cbex_sumq_arr[j] = queries[j].cbex_sumq;
++
++#pragma omp parallel for schedule(dynamic, 1)
++    for (int i = 0; i < num_full_bit_candidates; ++i) {
++        int doc_id = refined_doc_ids[full_bit_candidate_indices[i]];
++        size_t doc_start = doc_ptrs_[doc_id];
++        size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
++
++        alignas(64) float decoded[PADDED_DIM];
++        alignas(64) float full_ip[Q_DOCLEN];
++        alignas(64) float max_ts[Q_DOCLEN];
++        __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
++        for (size_t j = 0; j < Q_DOCLEN; j += 16)
++            _mm512_store_ps(&max_ts[j], neg_inf);
++
++        for (size_t t = 0; t < n_tok; t++) {
++            size_t tid = doc_start + t;
++            unpack_func_(
++                reinterpret_cast<const uint8_t*>(
++                    &full_bit_codes[tid * full_bit_codes_stride]),
++                decoded, PADDED_DIM);
++            if (t + 1 < n_tok) {
++                __builtin_prefetch(
++                    &full_bit_codes[(tid + 1) * full_bit_codes_stride], 0, 3);
++                __builtin_prefetch(&full_bit_factors[tid + 1], 0, 1);
++            }
++            rabitqlib::gemv_batch8_avx512(
++                queries_flat, decoded,
++                full_ip,
++                Q_DOCLEN, PADDED_DIM);
++
++            const float full_bit_factor = full_bit_factors[tid];
++            const __m512 full_bit_factor_vector =
++                _mm512_set1_ps(full_bit_factor);
++
++            for (size_t j = 0; j < Q_DOCLEN; j += 16) {
++                __m512 full_ip_v = _mm512_load_ps(&full_ip[j]);
++                __m512 cbex    = _mm512_load_ps(&cbex_sumq_arr[j]);
++                __m512 combined = _mm512_mul_ps(
++                    _mm512_sub_ps(full_ip_v, cbex),
++                    full_bit_factor_vector);
++                _mm512_store_ps(&max_ts[j],
++                    _mm512_max_ps(_mm512_load_ps(&max_ts[j]), combined));
++            }
++        }
++
++        __m512 sum = _mm512_load_ps(&max_ts[0]);
++        for (size_t j = 16; j < Q_DOCLEN; j += 16)
++            sum = _mm512_add_ps(sum, _mm512_load_ps(&max_ts[j]));
++        full_bit_scores[i] = {_mm512_reduce_add_ps(sum), doc_id};
++    }
++}
++
++} // namespace Chimera
+--- a/cpp/src/search_impl.cu
++++ b/cpp/src/search_impl.cu
+@@ -16,7 +16,7 @@
+ #include "rabitqlib/utils/space.hpp"
+ 
+ #include <algorithm>
+-#include <immintrin.h>
++#include "rabitqlib/utils/chimera_simd.hpp"
+ #include <limits>
+ #include <numeric>
+ #include <queue>
+@@ -494,8 +494,11 @@
+     }
+ 
+     result.clear();
++    last_result_scores_.clear();
++    if (capture_scores_) last_result_scores_.reserve(k);
+     for (size_t i = 0; i < k && !full_bit_result_heap.empty(); ++i) {
+         result.push_back(full_bit_result_heap.top().second);
++        if (capture_scores_) last_result_scores_.push_back(full_bit_result_heap.top().first);
+         full_bit_result_heap.pop();
+     }
+ 
+@@ -507,70 +510,5 @@
+     }
+ }
+ 
+-void chimera_index::compute_full_bit_scores(
+-    const int* refined_doc_ids,
+-    const int* full_bit_candidate_indices,
+-    int num_full_bit_candidates,
+-    const float* queries_flat,
+-    const QueryState* queries,
+-    std::pair<float, int>* full_bit_scores
+-) {
+-    const size_t full_bit_codes_stride = PADDED_DIM * (1 + ex_bits) / 8;
+-    const auto& full_bit_codes = full_bit_codes_;
+-    const auto& full_bit_factors = full_bit_factors_;
+-    alignas(64) float cbex_sumq_arr[Q_DOCLEN];
+-    for (size_t j = 0; j < Q_DOCLEN; j++)
+-        cbex_sumq_arr[j] = queries[j].cbex_sumq;
+-
+-#pragma omp parallel for schedule(dynamic, 1)
+-    for (int i = 0; i < num_full_bit_candidates; ++i) {
+-        int doc_id = refined_doc_ids[full_bit_candidate_indices[i]];
+-        size_t doc_start = doc_ptrs_[doc_id];
+-        size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
+-
+-        alignas(64) float decoded[PADDED_DIM];
+-        alignas(64) float full_ip[Q_DOCLEN];
+-        alignas(64) float max_ts[Q_DOCLEN];
+-        __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+-        for (size_t j = 0; j < Q_DOCLEN; j += 16)
+-            _mm512_store_ps(&max_ts[j], neg_inf);
+-
+-        for (size_t t = 0; t < n_tok; t++) {
+-            size_t tid = doc_start + t;
+-            unpack_func_(
+-                reinterpret_cast<const uint8_t*>(
+-                    &full_bit_codes[tid * full_bit_codes_stride]),
+-                decoded, PADDED_DIM);
+-            if (t + 1 < n_tok) {
+-                __builtin_prefetch(
+-                    &full_bit_codes[(tid + 1) * full_bit_codes_stride], 0, 3);
+-                __builtin_prefetch(&full_bit_factors[tid + 1], 0, 1);
+-            }
+-            rabitqlib::gemv_batch8_avx512(
+-                queries_flat, decoded,
+-                full_ip,
+-                Q_DOCLEN, PADDED_DIM);
+-
+-            const float full_bit_factor = full_bit_factors[tid];
+-            const __m512 full_bit_factor_vector =
+-                _mm512_set1_ps(full_bit_factor);
+-
+-            for (size_t j = 0; j < Q_DOCLEN; j += 16) {
+-                __m512 full_ip_v = _mm512_load_ps(&full_ip[j]);
+-                __m512 cbex    = _mm512_load_ps(&cbex_sumq_arr[j]);
+-                __m512 combined = _mm512_mul_ps(
+-                    _mm512_sub_ps(full_ip_v, cbex),
+-                    full_bit_factor_vector);
+-                _mm512_store_ps(&max_ts[j],
+-                    _mm512_max_ps(_mm512_load_ps(&max_ts[j]), combined));
+-            }
+-        }
+-
+-        __m512 sum = _mm512_load_ps(&max_ts[0]);
+-        for (size_t j = 16; j < Q_DOCLEN; j += 16)
+-            sum = _mm512_add_ps(sum, _mm512_load_ps(&max_ts[j]));
+-        full_bit_scores[i] = {_mm512_reduce_add_ps(sum), doc_id};
+-    }
+-}
+ 
+ }  // namespace Chimera
+--- a/cpp/third_party/rabitqlib/quantization/pack_excode.hpp
++++ b/cpp/third_party/rabitqlib/quantization/pack_excode.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+ 
+-#include <immintrin.h>
++#include "rabitqlib/utils/chimera_simd.hpp"
+ #include <omp.h>
+ 
+ #include <cmath>
+@@ -11,7 +11,7 @@
+ 
+ namespace rabitqlib::quant::rabitq_impl::ex_bits {
+ inline void packing_1bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     // ! require dim % 16 == 0
+     for (size_t j = 0; j < dim; j += 16) {
+         uint16_t code = 0;
+@@ -30,7 +30,7 @@
+ }
+ 
+ inline void packing_2bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     // ! require dim % 16 == 0
+     for (size_t j = 0; j < dim; j += 16) {
+         // pack 16 2-bit codes into int32
+@@ -54,7 +54,7 @@
+ }
+ 
+ inline void packing_3bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     // ! require dim % 64 == 0
+     const __m128i mask = _mm_set1_epi8(0b11);
+     for (size_t d = 0; d < dim; d += 64) {
+@@ -104,7 +104,7 @@
+ inline void packing_4bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+ // although this part only requries SSE, computing inner product for this orgnization
+ // requires AVX512F, similar for remaining functions
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     // ! require dim % 16 == 0
+     for (size_t j = 0; j < dim; j += 16) {
+         // pack 16 4-bit codes into uint64
+@@ -127,7 +127,7 @@
+ }
+ 
+ inline void packing_5bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     // ! require dim % 64 == 0
+     const __m128i mask = _mm_set1_epi8(0b1111);
+     for (size_t j = 0; j < dim; j += 64) {
+@@ -172,7 +172,7 @@
+ }
+ 
+ inline void packing_6bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     constexpr int64_t kMask4 = 0x0f0f0f0f0f0f0f0f;
+     constexpr int32_t kMask2 = 0x30303030;
+     for (size_t j = 0; j < dim; j += 16) {
+@@ -205,7 +205,7 @@
+ }
+ 
+ inline void packing_7bit_excode(const uint8_t* o_raw, uint8_t* o_compact, size_t dim) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     // for vec00 to vec47, split code into 6 + 1
+     // for vec48 to vec63, split code into 2 + 2 + 2 + 1
+     const __m128i mask2 = _mm_set1_epi8(0b11000000);
+--- a/cpp/third_party/rabitqlib/utils/chimera_simd.hpp
++++ b/cpp/third_party/rabitqlib/utils/chimera_simd.hpp
+@@ -0,0 +1,38 @@
++#pragma once
++#if defined(__aarch64__)
++#if defined(__CUDACC__)
++#define SIMDE_NO_NATIVE
++#endif
++#define SIMDE_ENABLE_NATIVE_ALIASES
++#include "simde-0.8.2/simde/x86/avx512.h"
++
++inline __mmask16 _cvtu32_mask16(uint32_t v) { return static_cast<__mmask16>(v); }
++inline __m512i _mm512_cvtepu8_epi32(__m128i a) {
++    const auto x=simde__m128i_to_private(a); simde__m512i_private y;
++    for(int i=0;i<16;++i) y.i32[i]=x.u8[i]; return simde__m512i_from_private(y);
++}
++inline __m512i _mm512_cvtepi8_epi32(__m128i a) {
++    const auto x=simde__m128i_to_private(a); simde__m512i_private y;
++    for(int i=0;i<16;++i) y.i32[i]=x.i8[i]; return simde__m512i_from_private(y);
++}
++inline __m128i _mm512_cvtepi32_epi8(__m512i a) {
++    const auto x=simde__m512i_to_private(a); simde__m128i_private y;
++    for(int i=0;i<16;++i) y.u8[i]=static_cast<uint8_t>(x.i32[i]); return simde__m128i_from_private(y);
++}
++inline __m256i _mm512_cvtepi32_epi16(__m512i a) {
++    const auto x=simde__m512i_to_private(a); simde__m256i_private y;
++    for(int i=0;i<16;++i) y.u16[i]=static_cast<uint16_t>(x.i32[i]); return simde__m256i_from_private(y);
++}
++inline void _mm_storeu_epi8(void* p, __m128i a) {simde_mm_storeu_si128(p,a);}
++inline float _mm512_reduce_add_ps(__m512 a) {
++    const auto x=simde__m512_to_private(a);
++    // AVX512 reduction tree: 512->256->128->64->32.
++    float q[8]; for(int i=0;i<8;++i) q[i]=x.f32[i]+x.f32[i+8];
++    float r[4]; for(int i=0;i<4;++i) r[i]=q[i]+q[i+4];
++    return (r[0]+r[2])+(r[1]+r[3]);
++}
++
++#define CHIMERA_SIMDE_AVX512 1
++#else
++#include <immintrin.h>
++#endif
+--- a/cpp/third_party/rabitqlib/utils/fht_avx.cpp
++++ b/cpp/third_party/rabitqlib/utils/fht_avx.cpp
+@@ -1,3 +1,138 @@
++#if defined(__aarch64__)
++#include <cstddef>
++template<class T> static void chimera_fht_portable(T* buf, int log_n) {
++    const size_t n = size_t{1} << log_n;
++    for (size_t half = 1; half < n; half *= 2)
++        for (size_t base = 0; base < n; base += 2 * half)
++            for (size_t j = 0; j < half; ++j) {
++                const T u = buf[base+j], v = buf[base+j+half];
++                buf[base+j] = u + v;
++                buf[base+j+half] = u - v;
++            }
++}
++void helper_float_1(float* buf) { chimera_fht_portable(buf, 1); }
++void helper_float_1_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_2(float* buf) { chimera_fht_portable(buf, 2); }
++void helper_float_2_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_3(float* buf) { chimera_fht_portable(buf, 3); }
++void helper_float_3_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_4(float* buf) { chimera_fht_portable(buf, 4); }
++void helper_float_4_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_5(float* buf) { chimera_fht_portable(buf, 5); }
++void helper_float_5_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_6(float* buf) { chimera_fht_portable(buf, 6); }
++void helper_float_6_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_7(float* buf) { chimera_fht_portable(buf, 7); }
++void helper_float_7_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_8(float* buf) { chimera_fht_portable(buf, 8); }
++void helper_float_8_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_9(float* buf) { chimera_fht_portable(buf, 9); }
++void helper_float_9_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_10(float* buf) { chimera_fht_portable(buf, 10); }
++void helper_float_10_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_11(float* buf) { chimera_fht_portable(buf, 11); }
++void helper_float_11_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_12(float* buf) { chimera_fht_portable(buf, 12); }
++void helper_float_12_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_13(float* buf) { chimera_fht_portable(buf, 13); }
++void helper_float_13_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_14(float* buf) { chimera_fht_portable(buf, 14); }
++void helper_float_14_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_15(float* buf) { chimera_fht_portable(buf, 15); }
++void helper_float_15_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_16(float* buf) { chimera_fht_portable(buf, 16); }
++void helper_float_16_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_17(float* buf) { chimera_fht_portable(buf, 17); }
++void helper_float_17_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_18(float* buf) { chimera_fht_portable(buf, 18); }
++void helper_float_18_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_19(float* buf) { chimera_fht_portable(buf, 19); }
++void helper_float_19_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_20(float* buf) { chimera_fht_portable(buf, 20); }
++void helper_float_20_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_21(float* buf) { chimera_fht_portable(buf, 21); }
++void helper_float_21_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_22(float* buf) { chimera_fht_portable(buf, 22); }
++void helper_float_22_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_23(float* buf) { chimera_fht_portable(buf, 23); }
++void helper_float_23_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_24(float* buf) { chimera_fht_portable(buf, 24); }
++void helper_float_24_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_25(float* buf) { chimera_fht_portable(buf, 25); }
++void helper_float_25_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_26(float* buf) { chimera_fht_portable(buf, 26); }
++void helper_float_26_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_27(float* buf) { chimera_fht_portable(buf, 27); }
++void helper_float_27_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_28(float* buf) { chimera_fht_portable(buf, 28); }
++void helper_float_28_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_29(float* buf) { chimera_fht_portable(buf, 29); }
++void helper_float_29_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_float_30(float* buf) { chimera_fht_portable(buf, 30); }
++void helper_float_30_recursive(float* buf, int depth) { chimera_fht_portable(buf, depth); }
++int fht_float(float* buf, int log_n) { if(log_n < 0 || log_n > 30) return -1; chimera_fht_portable(buf, log_n); return 0; }
++void helper_double_1(double* buf) { chimera_fht_portable(buf, 1); }
++void helper_double_1_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_2(double* buf) { chimera_fht_portable(buf, 2); }
++void helper_double_2_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_3(double* buf) { chimera_fht_portable(buf, 3); }
++void helper_double_3_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_4(double* buf) { chimera_fht_portable(buf, 4); }
++void helper_double_4_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_5(double* buf) { chimera_fht_portable(buf, 5); }
++void helper_double_5_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_6(double* buf) { chimera_fht_portable(buf, 6); }
++void helper_double_6_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_7(double* buf) { chimera_fht_portable(buf, 7); }
++void helper_double_7_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_8(double* buf) { chimera_fht_portable(buf, 8); }
++void helper_double_8_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_9(double* buf) { chimera_fht_portable(buf, 9); }
++void helper_double_9_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_10(double* buf) { chimera_fht_portable(buf, 10); }
++void helper_double_10_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_11(double* buf) { chimera_fht_portable(buf, 11); }
++void helper_double_11_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_12(double* buf) { chimera_fht_portable(buf, 12); }
++void helper_double_12_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_13(double* buf) { chimera_fht_portable(buf, 13); }
++void helper_double_13_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_14(double* buf) { chimera_fht_portable(buf, 14); }
++void helper_double_14_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_15(double* buf) { chimera_fht_portable(buf, 15); }
++void helper_double_15_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_16(double* buf) { chimera_fht_portable(buf, 16); }
++void helper_double_16_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_17(double* buf) { chimera_fht_portable(buf, 17); }
++void helper_double_17_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_18(double* buf) { chimera_fht_portable(buf, 18); }
++void helper_double_18_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_19(double* buf) { chimera_fht_portable(buf, 19); }
++void helper_double_19_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_20(double* buf) { chimera_fht_portable(buf, 20); }
++void helper_double_20_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_21(double* buf) { chimera_fht_portable(buf, 21); }
++void helper_double_21_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_22(double* buf) { chimera_fht_portable(buf, 22); }
++void helper_double_22_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_23(double* buf) { chimera_fht_portable(buf, 23); }
++void helper_double_23_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_24(double* buf) { chimera_fht_portable(buf, 24); }
++void helper_double_24_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_25(double* buf) { chimera_fht_portable(buf, 25); }
++void helper_double_25_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_26(double* buf) { chimera_fht_portable(buf, 26); }
++void helper_double_26_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_27(double* buf) { chimera_fht_portable(buf, 27); }
++void helper_double_27_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_28(double* buf) { chimera_fht_portable(buf, 28); }
++void helper_double_28_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_29(double* buf) { chimera_fht_portable(buf, 29); }
++void helper_double_29_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++void helper_double_30(double* buf) { chimera_fht_portable(buf, 30); }
++void helper_double_30_recursive(double* buf, int depth) { chimera_fht_portable(buf, depth); }
++int fht_double(double* buf, int log_n) { if(log_n < 0 || log_n > 30) return -1; chimera_fht_portable(buf, log_n); return 0; }
++#else
+ #include "rabitqlib/utils/fht_avx.hpp"
+ 
+ // https://github.com/FALCONN-LIB/FFHT
+@@ -19595,3 +19730,5 @@
+   }
+   return 1;
+ }
++
++#endif
+--- a/cpp/third_party/rabitqlib/utils/space.hpp
++++ b/cpp/third_party/rabitqlib/utils/space.hpp
+@@ -1,7 +1,6 @@
+ #pragma once
+ 
+-#include <emmintrin.h>
+-#include <immintrin.h>
++#include "rabitqlib/utils/chimera_simd.hpp"
+ #include <omp.h>
+ 
+ #include <cassert>
+@@ -51,7 +50,7 @@
+     float lo,
+     float delta
+ ) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     size_t mul16 = dim - (dim & 0b1111);
+     size_t i = 0;
+     float one_over_delta = 1 / delta;
+@@ -79,7 +78,7 @@
+     float lo,
+     float delta
+ ) {
+-#if defined(__AVX512F__)
++#if (defined(__AVX512F__) || defined(CHIMERA_SIMDE_AVX512))
+     size_t mul16 = dim - (dim & 0b1111);
+     size_t i = 0;
+     float one_over_delta = 1 / delta;

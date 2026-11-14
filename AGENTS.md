@@ -1,11 +1,26 @@
-# Multi-query / Chimera+ workspace
+# Multi-vector research
 
-- Canonical project root: `/home/lxq/multi-query`; datasets/queries/groundtruth: `/home/lxq/data/multivector-colbertv2`; indexes: project `indexes/`.
-- Track source, static configuration and current final reports with Git. Keep datasets, indexes, environments, raw experiment outputs and receipts local and ignored.
-- All new temporary scripts, logs, builds, raw results and review receipts go under `ai-workspace/`. Existing frozen experiment namespaces remain available through compatibility links; preserve their files and identities.
-- Coordinate CPU/GPU heavy work through `~/device.lock`: exclusive nonblocking lock for builds and performance measurements, held through all child processes and synchronization. Only one index build at a time. Check external compute interference; do not stop other users' processes.
-- Verify exact PID/start time before stopping owned jobs. Preserve resumable checkpoints and interrupted evidence. Never use broad process kills or remove lock files to unlock.
-- MS MARCO is paused for migration at 142344192/597909919 committed tokens. Do not resume it or start PLAID unless the user authorizes continuation.
-- Keep one concise performance report at `reports/lotte-r10-brief.md`; separate Chimera+ flow research is `reports/chimera-plus.md`. Report official PLAID GPU only.
-- Do not edit frozen sources/binaries/specifications just to rewrite historical paths. Old graduate paths are compatibility links; update active documentation/configuration when needed.
-- Use diagrams for workflows and comparisons. Embed generated diagrams in Markdown; do not emit raw Mermaid flowcharts in TUI replies.
+研究 DGX Spark（GB10、20 核 ARM、128 GB UMA）上的多向量搜索。先读用户最新要求及 `reports/handoff.md`，再核对 Git、真实进程与实验制品。
+
+## 维护方式
+
+- 本仓库维护整个课题，包含 Chimera、PLAID、实验包装、配置和报告。不同探索按主题组织在 `systems/`；共用工具放 `scripts/`，静态设置放 `configs/`。
+- `ai-workspace/` 放 AI 临时代码、脚本、草稿与输出；`local/` 放本机环境、索引和历史运行材料。两者均被 Git 忽略，不强制加入版本控制。数据集放 `~/data/`。
+- 给用户的文档先润色，再放 `reports/`；性能结论汇入现有主报告，配图随文档保存，避免多份版本。
+- 修改源码、测试包装和配置时同步提交；Chimera 主源码在 `Chimera/`，提交后用 `scripts/sync_chimera.sh` 同步独立仓库。PLAID 官方源码和外层包装分开维护。
+- 保留本地材料和其他任务改动；不使用 `git clean`、`reset --hard`。不为改路径重写冻结实验身份；恢复任务使用原冻结源码与检查点。
+
+## 实验约束
+
+- CPU/GPU 共用 `~/device.lock`，通过 `flock` 协调。正式性能测试、全量构建用互斥锁；轻量且容许并发的探索用共享锁。普通文件操作无需锁。锁须覆盖初始化、子进程及最终同步。
+- 同一时间只构建一个索引；构建与正式性能测试不重叠。获取锁后仍检查并监测外部计算干扰，不停止其他用户进程。
+- 停止任务只操作确认身份和启动时间的自有精确 PID，保留可恢复检查点。禁止宽泛杀进程或删除锁文件。
+- 先做小规模正确性与耗时检查，再运行必要的全量测试。正式结果核验召回、返回 ID/分数、查询数及完成边界；失败和中断不算有效性能。
+- 同参优化与调参比较分别说明；不混用查询集、参数、实现或计时边界。说明平均值、P99、轮次范围和实际召回。
+
+## 协作与交付
+
+- 用户最新明确要求优先；不要根据历史计划自行恢复暂停任务或扩大测试。
+- 优先快速交付可核验结果，避免无收益的大规模扫描。回复和结论简短，流程及对比优先配图；TUI 不直接输出 Mermaid 图码。
+- 长任务完成、重要里程碑或阻塞时，少量使用全局 notify-user 技能并正常回复；不重复通知。
+- 需要代理时，可在加载 `~/.zshrc` 的 zsh 中使用 `proxy_on` / `proxy_off`（127.0.0.1:7770）。

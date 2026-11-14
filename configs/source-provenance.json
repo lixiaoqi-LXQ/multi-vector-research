@@ -1,0 +1,20 @@
+{
+  "chimera": {
+    "upstream": "https://github.com/iidyc/Chimera",
+    "commit": "f6c3a7925924283fc0bc4da64ce78f9cf129bca6",
+    "arm_baseline_commit": "5a40949",
+    "gpu_scorer_commit": "c97f24cc7ea011e0da3fe4a6db808eb0c10590cc",
+    "maintained_path": "Chimera",
+    "mirror": "https://github.com/lixiaoqi-LXQ/Chimera-uma",
+    "mirror_branch": "Chimera+",
+    "subtree_anchor": "c97f24cc7ea011e0da3fe4a6db808eb0c10590cc"
+  },
+  "plaid": {
+    "upstream": "https://github.com/stanford-futuredata/ColBERT",
+    "commit": "cc4f3dc91c0b45d2d08c251d9d95178285c65f1c",
+    "maintained_path": "systems/plaid/ColBERT-main",
+    "official_tree_modifications": 0,
+    "adaptations_path": "systems/plaid",
+    "comparison": "all upstream archive regular files byte-identical; no missing file"
+  }
+}

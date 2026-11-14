@@ -1,0 +1,31 @@
+--- a/cpp/include/chimera/profiling.hpp
++++ b/cpp/include/chimera/profiling.hpp
+@@ -19,7 +19,8 @@
+         }
+         nvtxRangePushEx(&attr);
+     }
+-    ~ProfileRange() { if (enabled_) nvtxRangePop(); }
++    void close() noexcept { if (enabled_) { nvtxRangePop(); enabled_ = false; } }
++    ~ProfileRange() { close(); }
+     ProfileRange(const ProfileRange&) = delete;
+     ProfileRange& operator=(const ProfileRange&) = delete;
+  private:
+--- a/cpp/src/search_impl.cu
++++ b/cpp/src/search_impl.cu
+@@ -123,6 +123,7 @@
+     int& num_refined_candidates,
+     cudaStream_t stream) {
+     ProfileRange range(profiling_enabled_, "Chimera/candidate_generation_refinement");
++    ProfileRange generation(profiling_enabled_, "Chimera/candidate_generation");
+     check_cuda(cudaMemsetAsync(d_candidate_bitmap_, 0,
+                                candidate_bitmap_bucket_count_ * sizeof(candidate_bitmap_bucket_t),
+                                ws_->stream_d2h));
+@@ -204,6 +205,8 @@
+             " exceeded workspace bound " + std::to_string(max_candidate_docs_));
+     }
+ 
++    generation.close();
++    ProfileRange refinement(profiling_enabled_, "Chimera/candidate_refinement", num_candidate_docs);
+     ensure_candidate_capacity(static_cast<size_t>(num_candidate_docs));
+     if (!skips_candidate_refinement(options_.algorithm_variant))
+     check_cuda(cudaMemsetAsync(ws_->d_partial_query_scores,

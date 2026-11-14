@@ -1,7 +1,7 @@
 {
   "paper": "https://arxiv.org/html/2608.23553v2",
   "hardware": "NVIDIA DGX Spark GB10, ARM64, UMA",
-  "data_root": "/home/lxq/graduate/data",
+  "data_root": "/home/lxq/data",
   "dataset": {
     "repository": "tuskanny/lotte_pooled_colbertv2",
     "revision": "e3745bd22a3be48d167c438fc8a7a839b86860b1",
@@ -320,7 +320,7 @@
       "allocation_bytes": 4096
     },
     "probe_scope": "CUDA driver/runtime attribute calls only; no allocation/kernel/synchronization",
-    "evidence": "/home/lxq/multi-query/systems/chimera/review/cuda-host-attributes/result.json",
+    "evidence": "/home/lxq/multi-vector-research/local/legacy-systems/chimera/review/cuda-host-attributes/result.json",
     "actual_cuvs_host_dataset_pointer_probe": {
       "context": "live CAGRA graph built from caller std::vector centroid matrix",
       "aliases_caller_buffer": true,
@@ -340,7 +340,7 @@
       "MS MARCO after first LoTTE delivery"
     ],
     "coarse_ablation_build": "checkpoint stopped at user request; resume later serially",
-    "document_review": "existing doc-review after the delivery batch tests complete, before publishing its report",
+    "document_review": "用户直接审阅Markdown，不自动送审或生成PDF",
     "first_delivery": {
       "dataset": "LoTTE full",
       "bits": 4,

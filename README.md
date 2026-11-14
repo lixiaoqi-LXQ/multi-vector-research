@@ -1,37 +1,33 @@
-# Multi-query：Chimera / PLAID 多向量检索
+# Multi-vector research
 
-当前项目统一位于 `/home/lxq/multi-query`。研究 DGX Spark（GB10、20核ARM、128GB UMA）上的多向量搜索，包含原Chimera、GPU完整4bit精排的Chimera+及官方PLAID GPU路径。
+DGX Spark UMA 平台上的多向量搜索研究：复现 Chimera、官方 PLAID，并探索 GPU 精排等改进。
 
-## 入口
-
-- [统一实验报告](reports/lotte-r10-brief.md)：LoTTE R10/R100、平均/P99延迟和瓶颈。
-- [Chimera+单query流程图](reports/chimera-plus.md)：24次kernel调用、传输及同步。
-- [Chimera+源码说明](Chimera/README.md)。
-
-| 路径 | 内容 |
+| 目录 | 用途 |
 |---|---|
-| `Chimera/` | 当前Chimera+ C++/CUDA源码和数值测试 |
-| `systems/plaid/ColBERT-main/` | 官方ColBERT/PLAID源码 |
-| `systems/plaid/*.py` | 预编码数据接入、原生GPU搜索、验收与实验入口 |
-| `systems/chimera/` | ARM适配、原Chimera搜索/构建监督与验收工具 |
-| `systems/chimera-ms-sorted-gather/` | MS MARCO主索引恢复使用的冻结构建源码与工具 |
-| `systems/chimera-alg-ablation/source/` | 已测原Chimera二进制对应源码，正式模式为Full |
-| `configs/`、`scripts/` | 项目设置与数据准备入口 |
-| `reports/`、`report-assets/` | 当前报告、配图与绘图源码 |
-| `indexes/` | 本地索引，不提交Git |
-| `ai-workspace/` | 构建缓存、临时材料、迁移收据与状态，不提交Git |
-| `data` | 链接到 `/home/lxq/data/multivector-colbertv2` |
+| `Chimera/` | Chimera / Chimera+ 主源码，CPU/GPU 精排可选 |
+| `systems/` | PLAID 官方源码、适配包装及按研究主题组织的实验代码 |
+| `scripts/`、`configs/` | 共用工具、绘图源码、实验参数与来源声明 |
+| `reports/` | 面向用户的报告、配图及交接文档 |
+| `local/` | 本机环境、索引、冻结实验与历史材料；Git 忽略 |
+| `ai-workspace/` | AI 临时脚本、草稿、输出；Git 忽略 |
 
-数据集、查询和真值在 `~/data/multivector-colbertv2/`；索引实际保存在本项目`indexes/`。数据目录里的旧`indexes`入口链接到此目录，构建缓存链接到本项目`ai-workspace/index-build-cache/`。
+数据集在 `~/data/multivector-colbertv2/`；本机目录为 `~/multi-vector-research`。
 
-## Git与兼容路径
+- [实验报告](reports/lotte-r10-brief.md)：LoTTE R10/R100，端到端性能与瓶颈。
+- [Chimera+ 查询流程](reports/chimera-plus.md)。
+- [交接与后续计划](reports/handoff.md)：当前状态、测试约束和用户偏好。
 
-项目已统一为一个Git仓库，当前分支`Chimera+`。原Chimera+提交`c97f24c`及`baseline`分支历史保留；本次迁移提交将源码归入`Chimera/`并纳入PLAID和实验工具。数据、索引、日志、环境和原始实验结果留在本地，不进Git。
+## 版本维护
 
-原graduate项目、运行工作区和数据目录保留符号链接。冻结实验规格、编译缓存和既有Python环境因此仍可通过旧绝对路径访问；迁移没有改写冻结源码、二进制或检查点。
+本仓库 [multi-vector-research](https://github.com/lixiaoqi-LXQ/multi-vector-research) 是整个课题的修改入口。源码、测试包装、配置、补丁和正式报告随 Git 提交；新尝试按主题放在 `systems/<主题>/`，共用工具保持一份。临时代码先放 `ai-workspace/`，整理成熟后再进入维护目录。
 
-## 当前后台状态
+`Chimera/` 以 subtree 方式同步到 [Chimera-uma](https://github.com/lixiaoqi-LXQ/Chimera-uma) 的 `Chimera+` 分支；原 ARM 基线为 `baseline`，上游原 `main` 保留。修改在本仓库完成并提交后执行：
 
-MS MARCO数据已完整下载。Chimera主4bit索引在迁移前已安全停止：142,344,192 / 597,909,919 tokens，2172个已提交批次。检查点保存在`ai-workspace/index-build-cache/`；PLAID全量MS主索引尚未开始。迁移后不自动恢复计算。
+```bash
+git push origin main
+./scripts/sync_chimera.sh
+```
 
-继续重负载任务前按 `~/device.lock` 取得独占锁，同一时间只构建一个索引。新运行输出统一放`ai-workspace/`。现有`systems/`内历史运行材料按忽略规则保留，源码与必要配置由Git追踪。
+PLAID 上游代码固定版本保存在 `systems/plaid/ColBERT-main/`，当前未修改官方文件；包装改动在相邻目录直接追踪。[来源声明](configs/source-provenance.json) 记录两套系统的版本，[端点参数](configs/lotte-endpoints.json) 对应报告中的四组测试。
+
+本机历史运行树完整保留在 `local/legacy-systems/`；原 graduate 路径通过链接指向它。冻结实验文件保持原身份，用于恢复暂停任务。`data`、`indexes` 和 `report-assets` 是本机兼容入口，不提交。

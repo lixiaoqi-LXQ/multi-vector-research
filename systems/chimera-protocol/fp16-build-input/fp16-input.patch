@@ -1,0 +1,495 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -54,6 +54,7 @@
+     cpp/src/build_index.cu
+     cpp/src/chimera_index.cu
+     cpp/src/io.cpp
++    cpp/src/fp16_input.cpp
+     cpp/src/ivf_pg.cpp
+     cpp/src/kernels.cu
+     cpp/src/quantization.cpp
+--- a/cpp/apps/build.cpp
++++ b/cpp/apps/build.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include <iostream>
+ #include "mapped_embeddings.hpp"
++#include "mapped_fp16_npy.hpp"
++#include <limits>
+ 
+ using namespace Chimera;
+ 
+@@ -21,16 +23,26 @@
+     }
+ 
+     auto doc_lens = load_doclens(args.doclens_file);
+-    MappedEmbeddings embeddings(args.data_file);
+-    const size_t dimension = embeddings.dimension();
+     chimera_index index;
+-    index.build_from_ptr(
+-        embeddings.data(),
+-        embeddings.size(),
+-        dimension,
+-        doc_lens,
+-        args.n_clusters,
+-        args.ex_bits);
++    if (!args.fp16_npy_file.empty()) {
++        if (doc_lens.empty()) throw std::invalid_argument("Document lengths must not be empty");
++        size_t tokens = 0;
++        for (int length : doc_lens) {
++            if (length <= 0 || static_cast<size_t>(length) > std::numeric_limits<size_t>::max() - tokens) {
++                throw std::invalid_argument("Invalid or overflowing document lengths");
++            }
++            tokens += static_cast<size_t>(length);
++        }
++        MappedFp16Npy embeddings(args.fp16_npy_file, tokens);
++        std::cout << "[BUILD] input=FP16-NPY values=" << embeddings.size()
++                  << " dimension=" << embeddings.dimension() << '\n';
++        index.build_from_f16_ptr(embeddings.data(), embeddings.size(), embeddings.dimension(),
++                                 doc_lens, args.n_clusters, args.ex_bits);
++    } else {
++        MappedEmbeddings embeddings(args.data_file);
++        index.build_from_ptr(embeddings.data(), embeddings.size(), embeddings.dimension(),
++                             doc_lens, args.n_clusters, args.ex_bits);
++    }
+     index.save(args.index_dir);
+     return 0;
+ }
+--- a/cpp/apps/utils.cpp
++++ b/cpp/apps/utils.cpp
+@@ -71,6 +71,8 @@
+             args.doclens_file = require_value(argc, argv, i, arg);
+         } else if (arg == "--data") {
+             args.data_file = require_value(argc, argv, i, arg);
++        } else if (arg == "--fp16-npy") {
++            args.fp16_npy_file = require_value(argc, argv, i, arg);
+         } else if (arg == "--n-clusters") {
+             args.n_clusters = std::stoull(require_value(argc, argv, i, arg));
+         } else if (arg == "--ex-bits") {
+@@ -80,8 +82,11 @@
+         }
+     }
+ 
++    if (args.data_file.empty() == args.fp16_npy_file.empty()) {
++        throw std::runtime_error("Provide exactly one of --data (raw FP32) or --fp16-npy");
++    }
+     if (args.index_dir.empty() || args.doclens_file.empty() ||
+-        args.data_file.empty() || args.n_clusters == 0 || args.ex_bits == 0) {
++        args.n_clusters == 0 || args.ex_bits == 0) {
+         throw std::runtime_error("Missing required arguments.");
+     }
+     return args;
+@@ -157,12 +162,13 @@
+ void print_build_help(const char* program) {
+     std::cout
+         << "Usage: " << program
+-        << " --index <index_dir> --doclens <doclens> --data <data>"
++        << " --index <index_dir> --doclens <doclens> (--data <FP32-bin> | --fp16-npy <NPY>)"
+         << " --n-clusters <count> --ex-bits <count>\n\n"
+         << "Arguments:\n"
+         << "  --index, -i      Output index directory.\n"
+         << "  --doclens, -d    Input document-length file.\n"
+-        << "  --data           Input token-embedding file.\n"
++        << "  --data           Original raw FP32 token-embedding file.\n"
++        << "  --fp16-npy       Read-only C-order NPY <u2 raw FP16 bits or <f2 matrix.\n"
+         << "  --n-clusters     Number of centroids in the CAGRA graph.\n"
+         << "  --ex-bits        Residual quantization bits per dimension (1-7).\n";
+ }
+--- a/cpp/apps/utils.hpp
++++ b/cpp/apps/utils.hpp
+@@ -14,6 +14,7 @@
+ struct BuildCliArgs {
+     std::string index_dir;
+     std::string data_file;
++    std::string fp16_npy_file;
+     std::string doclens_file;
+     size_t n_clusters = 0;
+     size_t ex_bits = 0;
+--- a/cpp/include/chimera/chimera_index.cuh
++++ b/cpp/include/chimera/chimera_index.cuh
+@@ -22,6 +22,7 @@
+ namespace Chimera {
+ 
+ struct IVF_PG;
++class FloatInputView;
+ 
+ struct SearchOptions {
+     int nprobe = 128;
+@@ -64,6 +65,16 @@
+         size_t ex_bits,
+         const SearchOptions& options = {});
+ 
++    // IEEE FP16 bit patterns. Expanded exactly to FP32 in bounded CPU buffers.
++    void build_from_f16_ptr(
++        const uint16_t* embeddings,
++        size_t embedding_values,
++        size_t dimension,
++        const std::vector<int>& doc_lens,
++        size_t n_clusters,
++        size_t ex_bits,
++        const SearchOptions& options = {});
++
+     std::vector<size_t> search(
+         const std::vector<float>& query,
+         size_t k);
+@@ -86,6 +97,14 @@
+     chimera_index& operator=(const chimera_index&) = delete;
+ 
+   private:
++    void build_from_view(
++        const FloatInputView& embeddings,
++        size_t dimension,
++        const std::vector<int>& doc_lens,
++        size_t n_clusters,
++        size_t ex_bits,
++        const SearchOptions& options);
++
+     struct QueryState;
+ 
+     struct IndexHeader {
+--- a/cpp/src/build_index.cu
++++ b/cpp/src/build_index.cu
+@@ -23,6 +23,7 @@
+ #include <vector>
+ 
+ #include "chimera/config.cuh"
++#include "chimera/fp16_input.hpp"
+ #include "chimera/ivf_pg.hpp"
+ #include "chimera/quantization.hpp"
+ #include "rabitqlib/utils/rotator.hpp"
+@@ -33,17 +34,7 @@
+ 
+ namespace {
+ 
+-// Minimal non-owning view shared by vector and mmap-backed callers.
+-class FloatView {
+- public:
+-    FloatView(const float* data, size_t size) : data_(data), size_(size) {}
+-    const float* data() const { return data_; }
+-    size_t size() const { return size_; }
+-    bool empty() const { return data_ == nullptr || size_ == 0; }
+- private:
+-    const float* data_;
+-    size_t size_;
+-};
++using FloatView = FloatInputView;
+ 
+ template <typename T>
+ void release_vector(std::vector<T>& data) {
+@@ -192,10 +183,9 @@
+ 
+     std::vector<float> centroids(checked_product(n_clusters, dimension, "centroids"));
+     for (size_t cluster = 0; cluster < n_clusters; ++cluster) {
+-        std::memcpy(
++        embeddings.copy_to(
+             centroids.data() + cluster * dimension,
+-            embeddings.data() + sampled_ids[cluster] * dimension,
+-            dimension * sizeof(float));
++            sampled_ids[cluster] * dimension, dimension);
+     }
+     return centroids;
+ }
+@@ -215,13 +205,23 @@
+     DeviceBuffer<uint32_t> device_labels(batch_capacity);
+     DeviceBuffer<float> device_distances(batch_capacity);
+ 
++    // Only FP16 input allocates an additional FP32 host assignment batch.
++    std::vector<float> expanded_batch;
++    if (embeddings.is_fp16()) expanded_batch.resize(batch_capacity * dimension);
+     std::vector<uint32_t> assignments(num_embeddings);
+     for (size_t start = 0; start < num_embeddings; start += batch_capacity) {
+         const size_t count = std::min(batch_capacity, num_embeddings - start);
++        const float* source = nullptr;
++        if (embeddings.is_fp16()) {
++            embeddings.copy_to(expanded_batch.data(), start * dimension, count * dimension);
++            source = expanded_batch.data();
++        } else {
++            source = embeddings.float_data() + start * dimension;
++        }
+         check_cuda(
+             cudaMemcpy(
+                 device_embeddings.data(),
+-                embeddings.data() + start * dimension,
++                source,
+                 count * dimension * sizeof(float),
+                 cudaMemcpyHostToDevice),
+             "Copying embeddings to the GPU");
+@@ -293,6 +293,7 @@
+ #pragma omp parallel
+     {
+         std::vector<float> rotated(PADDED_DIM);
++        std::array<float, PADDED_DIM> expanded_row;
+ 
+ #pragma omp for schedule(static)
+         for (std::int64_t row = 0;
+@@ -300,7 +301,7 @@
+              ++row) {
+             const size_t index = static_cast<size_t>(row);
+             rotator.rotate(
+-                embeddings.data() + index * dimension,
++                embeddings.row_data(index * dimension, dimension, expanded_row.data()),
+                 rotated.data());
+             encode_one_bit(
+                 rotated.data(),
+@@ -419,8 +420,30 @@
+     size_t n_clusters,
+     size_t ex_bits,
+     const SearchOptions& options) {
++    build_from_view(FloatInputView(embedding_data, embedding_values), dimension,
++                    doc_lens, n_clusters, ex_bits, options);
++}
++
++void chimera_index::build_from_f16_ptr(
++    const uint16_t* embedding_data,
++    size_t embedding_values,
++    size_t dimension,
++    const std::vector<int>& doc_lens,
++    size_t n_clusters,
++    size_t ex_bits,
++    const SearchOptions& options) {
++    build_from_view(FloatInputView(embedding_data, embedding_values), dimension,
++                    doc_lens, n_clusters, ex_bits, options);
++}
++
++void chimera_index::build_from_view(
++    const FloatInputView& embeddings,
++    size_t dimension,
++    const std::vector<int>& doc_lens,
++    size_t n_clusters,
++    size_t ex_bits,
++    const SearchOptions& options) {
+     validate_search_options(options);
+-    const FloatView embeddings(embedding_data, embedding_values);
+     const size_t num_embeddings = validate_build_inputs(
+         embeddings,
+         dimension,
+--- /dev/null
++++ b/cpp/include/chimera/fp16_input.hpp
+@@ -0,0 +1,50 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <stdexcept>
++
++namespace Chimera {
++
++// IEEE binary16 -> binary32, including NumPy-compatible quiet NaN payloads.
++// Always writes the exact converted bits; returns false if source has Inf/NaN.
++// Implementation is ordinary C++, with integer NEON only in a CXX translation unit.
++bool expand_fp16_to_fp32(const uint16_t* source, float* destination,
++                         size_t count) noexcept;
++
++class FloatInputView {
++ public:
++    FloatInputView(const float* source, size_t count)
++        : fp32_(source), fp16_(nullptr), count_(count) {}
++    FloatInputView(const uint16_t* source, size_t count)
++        : fp32_(nullptr), fp16_(source), count_(count) {}
++    size_t size() const { return count_; }
++    bool empty() const { return count_ == 0 || (fp32_ == nullptr && fp16_ == nullptr); }
++    bool is_fp16() const { return fp16_ != nullptr; }
++    const float* float_data() const { return fp32_; }
++    void copy_to(float* destination, size_t offset, size_t count) const {
++        if (offset > count_ || count > count_ - offset) {
++            throw std::out_of_range("Embedding input view read exceeds source");
++        }
++        if (fp16_ != nullptr) {
++            if (!expand_fp16_to_fp32(fp16_ + offset, destination, count)) {
++                throw std::invalid_argument("FP16 input contains Inf or NaN");
++            }
++        } else if (count != 0) {
++            std::memcpy(destination, fp32_ + offset, count * sizeof(float));
++        }
++    }
++    // encode_embeddings runs only after assignment has checked every FP16 row.
++    // No exceptions inside its OpenMP region; the source is immutable during build.
++    const float* row_data(size_t offset, size_t count, float* scratch) const noexcept {
++        if (fp16_ == nullptr) return fp32_ + offset;
++        (void)expand_fp16_to_fp32(fp16_ + offset, scratch, count);
++        return scratch;
++    }
++ private:
++    const float* fp32_;
++    const uint16_t* fp16_;
++    size_t count_;
++};
++
++}  // namespace Chimera
+--- /dev/null
++++ b/cpp/src/fp16_input.cpp
+@@ -0,0 +1,66 @@
++#include "chimera/fp16_input.hpp"
++#include <limits>
++#if defined(__aarch64__)
++#include <arm_neon.h>
++#endif
++
++namespace Chimera {
++namespace {
++uint32_t scalar_bits(uint16_t input) noexcept {
++    const uint32_t sign = static_cast<uint32_t>(input & 0x8000u) << 16;
++    const uint32_t exponent = (input >> 10) & 31u;
++    uint32_t mantissa = input & 1023u;
++    if (exponent == 31) {
++        return sign | 0x7f800000u | (mantissa << 13) |
++               (mantissa != 0 ? 0x00400000u : 0u);
++    }
++    if (exponent != 0) return sign | ((exponent + 112u) << 23) | (mantissa << 13);
++    if (mantissa == 0) return sign;
++    int shift = 0;
++    while ((mantissa & 1024u) == 0) { mantissa <<= 1; ++shift; }
++    return sign | (static_cast<uint32_t>(113 - shift) << 23) | ((mantissa & 1023u) << 13);
++}
++}
++
++bool expand_fp16_to_fp32(const uint16_t* source, float* destination,
++                         size_t count) noexcept {
++    static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
++                  "Input conversion requires IEEE binary32");
++    size_t i = 0;
++    bool finite = true;
++#if defined(__aarch64__)
++    const uint32x4_t zero = vdupq_n_u32(0);
++    const uint32x4_t mask = vdupq_n_u32(1023u);
++    uint32x4_t invalid = zero;
++    for (; i + 4 <= count; i += 4) {
++        const uint32x4_t input = vmovl_u16(vld1_u16(source + i));
++        const uint32x4_t sign = vshlq_n_u32(vandq_u32(input, vdupq_n_u32(0x8000u)), 16);
++        const uint32x4_t exponent = vandq_u32(vshrq_n_u32(input, 10), vdupq_n_u32(31u));
++        const uint32x4_t mantissa = vandq_u32(input, mask);
++        const uint32x4_t normal = vorrq_u32(vshlq_n_u32(vaddq_u32(exponent, vdupq_n_u32(112u)), 23),
++                                           vshlq_n_u32(mantissa, 13));
++        const uint32x4_t shift = vsubq_u32(vclzq_u32(mantissa), vdupq_n_u32(21u));
++        uint32x4_t subnormal = vorrq_u32(
++            vshlq_n_u32(vsubq_u32(vdupq_n_u32(113u), shift), 23),
++            vshlq_n_u32(vandq_u32(vshlq_u32(mantissa, vreinterpretq_s32_u32(shift)), mask), 13));
++        subnormal = vbslq_u32(vceqq_u32(mantissa, zero), zero, subnormal);
++        const uint32x4_t quiet = vandq_u32(vmvnq_u32(vceqq_u32(mantissa, zero)), vdupq_n_u32(0x00400000u));
++        const uint32x4_t special = vorrq_u32(vdupq_n_u32(0x7f800000u),
++                                           vorrq_u32(vshlq_n_u32(mantissa, 13), quiet));
++        uint32x4_t result = vbslq_u32(vceqq_u32(exponent, zero), subnormal, normal);
++        const uint32x4_t is_special = vceqq_u32(exponent, vdupq_n_u32(31u));
++        result = vorrq_u32(sign, vbslq_u32(is_special, special, result));
++        vst1q_f32(destination + i, vreinterpretq_f32_u32(result));
++        invalid = vorrq_u32(invalid, is_special);
++    }
++    finite = vmaxvq_u32(invalid) == 0;
++#endif
++    for (; i < count; ++i) {
++        const uint32_t bits = scalar_bits(source[i]);
++        std::memcpy(destination + i, &bits, sizeof(bits));
++        finite = finite && ((source[i] & 0x7c00u) != 0x7c00u);
++    }
++    return finite;
++}
++
++}  // namespace Chimera
+--- /dev/null
++++ b/cpp/apps/mapped_fp16_npy.hpp
+@@ -0,0 +1,105 @@
++#pragma once
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <cerrno>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <regex>
++#include <stdexcept>
++#include <string>
++
++// Read-only C-order NPY v1/v2, dtype <u2 raw FP16 bits or <f2, shape [N,D].
++// Optional token prefix maps only complete required rows, enabling .partial use.
++class MappedFp16Npy {
++ public:
++    explicit MappedFp16Npy(const std::string& path, size_t requested_rows = 0) {
++#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
++#error "MappedFp16Npy requires a little-endian host"
++#endif
++        struct Descriptor { int value; ~Descriptor() { if (value >= 0) (void)::close(value); } } fd{
++            ::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
++        if (fd.value < 0) fail("open", path);
++        struct stat state {};
++        if (::fstat(fd.value, &state) != 0) fail("fstat", path);
++        if (!S_ISREG(state.st_mode) || state.st_size < 12) {
++            throw std::runtime_error("NPY input must be a regular file: " + path);
++        }
++        uint8_t prefix[12];
++        read_at(fd.value, prefix, sizeof(prefix), 0, path);
++        const uint8_t magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y'};
++        if (std::memcmp(prefix, magic, sizeof(magic)) != 0 || prefix[7] != 0 ||
++            (prefix[6] != 1 && prefix[6] != 2)) {
++            throw std::runtime_error("Expected NPY format v1/v2: " + path);
++        }
++        size_t header_start = prefix[6] == 1 ? 10 : 12;
++        size_t header_bytes = static_cast<size_t>(prefix[8]) | (static_cast<size_t>(prefix[9]) << 8);
++        if (prefix[6] == 2) header_bytes |= (static_cast<size_t>(prefix[10]) << 16) | (static_cast<size_t>(prefix[11]) << 24);
++        if (header_bytes == 0 || header_bytes > 1024 * 1024 ||
++            header_start + header_bytes > static_cast<uintmax_t>(state.st_size)) {
++            throw std::runtime_error("Invalid/truncated NPY header: " + path);
++        }
++        std::string header(header_bytes, '\0');
++        read_at(fd.value, header.data(), header_bytes, static_cast<off_t>(header_start), path);
++        const std::regex dtype(R"re(["']descr["']\s*:\s*["']<(u2|f2)["'])re");
++        const std::regex order(R"re(["']fortran_order["']\s*:\s*False)re");
++        const std::regex shape(R"re(["']shape["']\s*:\s*\(\s*([0-9]+)\s*,\s*([0-9]+)\s*,?\s*\))re");
++        std::smatch match;
++        if (!std::regex_search(header, dtype) || !std::regex_search(header, order) ||
++            !std::regex_search(header, match, shape)) {
++            throw std::runtime_error("Expected C-order NPY <u2/<f2 matrix [N,D]: " + path);
++        }
++        const auto parsed_rows = std::stoull(match[1].str());
++        const auto parsed_dimension = std::stoull(match[2].str());
++        if (parsed_rows == 0 || parsed_dimension == 0 ||
++            parsed_rows > std::numeric_limits<size_t>::max() ||
++            parsed_dimension > std::numeric_limits<size_t>::max()) {
++            throw std::runtime_error("Invalid NPY matrix dimensions: " + path);
++        }
++        const size_t rows = static_cast<size_t>(parsed_rows);
++        dimension_ = static_cast<size_t>(parsed_dimension);
++        offset_ = header_start + header_bytes;
++        if (offset_ % alignof(uint16_t) != 0 ||
++            dimension_ > (std::numeric_limits<size_t>::max() - offset_) / sizeof(uint16_t) / rows) {
++            throw std::runtime_error("NPY matrix size/alignment invalid: " + path);
++        }
++        const size_t expected_bytes = offset_ + rows * dimension_ * sizeof(uint16_t);
++        const size_t mapped_rows = requested_rows == 0 ? rows : requested_rows;
++        if (mapped_rows > rows) throw std::runtime_error("Requested token prefix exceeds NPY matrix: " + path);
++        values_ = mapped_rows * dimension_;
++        bytes_ = offset_ + values_ * sizeof(uint16_t);
++        if (static_cast<uintmax_t>(state.st_size) > static_cast<uintmax_t>(expected_bytes) ||
++            static_cast<uintmax_t>(state.st_size) < static_cast<uintmax_t>(bytes_)) {
++            throw std::runtime_error("NPY file does not contain the requested complete prefix, or has trailing bytes: " + path);
++        }
++        mapping_ = ::mmap(nullptr, bytes_, PROT_READ, MAP_PRIVATE, fd.value, 0);
++        if (mapping_ == MAP_FAILED) fail("mmap", path);
++        (void)::madvise(mapping_, bytes_, MADV_SEQUENTIAL);
++    }
++    ~MappedFp16Npy() { if (mapping_ != MAP_FAILED) (void)::munmap(mapping_, bytes_); }
++    MappedFp16Npy(const MappedFp16Npy&) = delete;
++    MappedFp16Npy& operator=(const MappedFp16Npy&) = delete;
++    const uint16_t* data() const {
++        return reinterpret_cast<const uint16_t*>(static_cast<const char*>(mapping_) + offset_);
++    }
++    size_t size() const { return values_; }
++    size_t dimension() const { return dimension_; }
++ private:
++    static void read_at(int fd, void* buffer, size_t count, off_t offset, const std::string& path) {
++        if (::pread(fd, buffer, count, offset) != static_cast<ssize_t>(count)) {
++            throw std::runtime_error("Failed reading NPY header: " + path);
++        }
++    }
++    [[noreturn]] static void fail(const char* operation, const std::string& path) {
++        const int error = errno;
++        throw std::runtime_error(std::string(operation) + " failed for " + path + ": " + std::strerror(error));
++    }
++    void* mapping_ = MAP_FAILED;
++    size_t bytes_ = 0;
++    size_t values_ = 0;
++    size_t dimension_ = 0;
++    size_t offset_ = 0;
++};

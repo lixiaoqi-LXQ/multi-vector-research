@@ -1,0 +1,51 @@
+--- /home/lxq/graduate/ai-workspace/research/multivector/chimera/profile-v2/run_bottleneck.py
++++ /home/lxq/graduate/ai-workspace/research/multivector/chimera/profile-v2/run_r10p95_overlap.py
+@@ -1,8 +1,9 @@
+-"""Thin NSYS-software/targeted-NCU adapter over existing profile-v2 exact tree supervision."""
++"""NSYS-only R10.95 overlap diagnostics; selected same-point chunks, user device.lock, no fixed idle delay."""
+ import argparse,fcntl,hashlib,json,os,subprocess,sys,time,uuid
+ from pathlib import Path
+ import bottleneck_plan as bp
+ v2=bp.v2;P=bp.P
++DEVICE_LOCK=str(Path.home()/"device.lock")
+ def read(p):return json.loads(Path(p).read_text())
+ def write(p,v):v2.write(p,v)
+ def values(directory,plan):
+@@ -22,7 +23,7 @@
+   if plaid:
+    if phase=='main-qa':command.remove('--nvtx-stages')
+   else:command[3]=str(Path(plan['_directory'])/('main-search'if phase=='main-qa'else'observation-search'))
+- cfg=dict(socket_name='chimera-bottleneck-'+nonce,token=nonce,lock_path='/tmp/uma-paper-device0.lock',engine_command=command,engine_binary=command[3],engine_sha256=bp.sha(command[3]),leaf_receipt=str(out/'leaf-lease.json'),tree_receipt=str(out/'tree-supervision.json'),timeout_s=900,cleanup_s=10)
++ cfg=dict(socket_name='chimera-bottleneck-'+nonce,token=nonce,lock_path=DEVICE_LOCK,engine_command=command,engine_binary=command[3],engine_sha256=bp.sha(command[3]),leaf_receipt=str(out/'leaf-lease.json'),tree_receipt=str(out/'tree-supervision.json'),timeout_s=900,cleanup_s=10)
+  if phase.endswith('-qa'):launch=[sys.executable,str(P/'leaf_exec.py'),str(cfgpath)]
+  else:
+   template=plan['NSYS']if phase=='nsys'else plan['NCU'][phase];mapping={'{phase_dir}':str(out),'{python}':sys.executable,'{tree_config}':str(cfgpath),'{exact_kernel_or_regex}':kernel or'','{1_to_3}':str(count)};launch=list(template)
+@@ -41,7 +42,7 @@
+  if not phase.endswith('-qa'):
+   i,x=values(Path(plan['_directory'])/'observation-qa',plan);j,y=values(out,plan);v2.need(v2.np.array_equal(i,j)and v2.np.array_equal(x.view(v2.np.uint32),y.view(v2.np.uint32)),'Profiled output IDs/F32bits changed');write(out/'counter-or-trace-generated.json',dict(status='GENERATED_PENDING_TRACE_OR_COUNTER_REVIEW',query_major_faults=v['pagefaults']['query_loop']['major_delta']if'pagefaults'in v else None,ordered_ID_F32bits_equal_QA=True,report_sha256=bp.sha(out/('trace.nsys-rep'if phase=='nsys'else'counters.ncu-rep')),performance_claim=False))
+ def main():
+- p=argparse.ArgumentParser(description=__doc__);p.add_argument('--plan',required=True);p.add_argument('--phase',choices=['qa','nsys','sol','memory','compute','latency'],required=True);p.add_argument('--kernel');p.add_argument('--launch-count',type=int,choices=[1,2,3],default=1);p.add_argument('--label');p.add_argument('--run',action='store_true');a=p.parse_args();file=Path(a.plan).resolve();plan=read(file);directory=file.parent
++ p=argparse.ArgumentParser(description=__doc__);p.add_argument('--plan',required=True);p.add_argument('--phase',choices=['qa','nsys'],required=True);p.add_argument('--kernel');p.add_argument('--launch-count',type=int,choices=[1,2,3],default=1);p.add_argument('--label');p.add_argument('--run',action='store_true');a=p.parse_args();file=Path(a.plan).resolve();plan=read(file);directory=file.parent;v2.need(plan.get('engine_kind')!='plaid','This task is Chimera-only');v2.need(plan['spec']['points'][0]['num_chunks']in [1,4,5],'Use selected same-point c1/c4/c5 only')
+  if a.phase not in ['qa','nsys']:v2.need(bool(a.kernel),'Select actual NSYS kernel before NCU')
+  if not a.run:print(json.dumps(dict(prepared_only=True,GPU_launched=False,phase=a.phase,kernel=a.kernel,launch_count=a.launch_count,plan_sha256=bp.sha(file))));return
+  v2.need(os.environ.get('UMA_RUN_GPU_TESTS')=='1','Root scheduling and explicit UMA_RUN_GPU_TESTS=1 required')
+@@ -50,15 +51,13 @@
+   import plaid_bottleneck_plan
+   plaid_bottleneck_plan.guard(plan)
+  else:v2.accepted_identity(plan['spec'])
+- os.environ['PLAID_DEVICE_LOCK']='/tmp/uma-paper-device0.lock';plan['_directory']=str(directory)
++ os.environ['PLAID_DEVICE_LOCK']=DEVICE_LOCK;plan['_directory']=str(directory)
+  if a.phase!='qa':v2.need(read(directory/'QA-acceptance.json')['plan_sha256']==bp.sha(file),'Same-plan32 QA required')
+  if a.phase not in ['qa','nsys']:
+   selection=read(directory/'NSYS-kernel-selection.json');v2.need(selection['trace_sha256']==bp.sha(directory/'nsys/trace.nsys-rep')and selection['kernel_tables_present']is True and selection['captured_queries']==32 and selection['original_query_rows']==plan['original_query_rows'],'Require actual complete query/kernel trace review');v2.need(1<=len(selection['counter_kernel_filters'])<=3 and a.kernel in selection['counter_kernel_filters'],'Select at most3 actual major kernel families from reviewed NSYS data')
+- with open('/tmp/uma-paper-device0.lock','a+')as lock:
+-  fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);plan['_lease']=lock;idle=[]
+-  for _ in range(10):
+-   u=subprocess.check_output(['nvidia-smi','--query-gpu=utilization.gpu','--format=csv,noheader,nounits'],text=True,timeout=5);v2.need(int(u.strip())==0,'GPU nonidle');idle.append(dict(unix=time.time(),utilization=0));time.sleep(1)
+-  label=a.label or(a.phase if a.phase in ['qa','nsys']else a.phase+'-'+hashlib.sha256(a.kernel.encode()).hexdigest()[:12]);v2.need('/'not in label and label not in ['.','..'],'Simple fresh label required');write(directory/(label+'-idle.json'),dict(real_global_exclusive_lease=True,samples=idle,plan_sha256=bp.sha(file)))
++ with open(DEVICE_LOCK,'a+')as lock:
++  fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);plan['_lease']=lock
++  label=a.label or(a.phase if a.phase in ['qa','nsys']else a.phase+'-'+hashlib.sha256(a.kernel.encode()).hexdigest()[:12]);v2.need('/'not in label and label not in ['.','..'],'Simple fresh label required');write(directory/(label+'-lease.json'),dict(device_lock=DEVICE_LOCK,real_exclusive_lease=True,fixed_idle_gate_seconds=0,plan_sha256=bp.sha(file)))
+   if a.phase=='qa':
+    for st in ['main-qa','observation-qa']:execute_one(plan,directory/st,st,None,1)
+    i,x=values(directory/'main-qa',plan);j,y=values(directory/'observation-qa',plan);v2.need(v2.np.array_equal(i,j)and v2.np.array_equal(x.view(v2.np.uint32),y.view(v2.np.uint32)),'Main/observation32 IDs or F32bits changed');write(directory/'QA-acceptance.json',dict(status='PASS_MAIN_OBSERVATION_K10_32',count=320,plan_sha256=bp.sha(file),performance_claim=False))

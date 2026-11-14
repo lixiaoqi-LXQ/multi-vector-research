@@ -1,0 +1,106 @@
+{
+  "sha": "cc4f3dc91c0b45d2d08c251d9d95178285c65f1c",
+  "node_id": "C_kwDOD-fCDNoAKGNjNGYzZGM5MWMwYjQ1ZDJkMDhjMjUxZDlkOTUxNzgyODVjNjVmMWM",
+  "commit": {
+    "author": {
+      "name": "Vishal Bakshi",
+      "email": "vdbakshi@gmail.com",
+      "date": "2025-10-14T18:50:11Z"
+    },
+    "committer": {
+      "name": "GitHub",
+      "email": "noreply@github.com",
+      "date": "2025-10-14T18:50:11Z"
+    },
+    "message": "Merge pull request #405 from robinnarsinghranabhat/bugfix/multigpu-data\n\nbugfix : Incorrect sample division for \"Single-Node, Multi-GPU\" ddp training\n\nHandles sample division in colbert/data/examples.py with:\n\n```python\n[self.data[idx + rank] for idx in range(0, len(self.data), nranks) if idx + rank < len(self.data)]\n```",
+    "tree": {
+      "sha": "f855e2d934576306c098c58fada83ceb2dd3e8fa",
+      "url": "https://api.github.com/repos/stanford-futuredata/ColBERT/git/trees/f855e2d934576306c098c58fada83ceb2dd3e8fa"
+    },
+    "url": "https://api.github.com/repos/stanford-futuredata/ColBERT/git/commits/cc4f3dc91c0b45d2d08c251d9d95178285c65f1c",
+    "comment_count": 0,
+    "verification": {
+      "verified": true,
+      "reason": "valid",
+      "signature": "-----BEGIN PGP SIGNATURE-----\n\nwsFcBAABCAAQBQJo7ptjCRC1aQ7uu5UhlAAAeaQQAFj+Pt7blyqv+hyCBW6FZ0EA\n7kDKdkuGdytpXJ8mwYdl3psTBKfTIBUlY0ml/TjyWuHE6uMrWLFEOIR0uOk7vWd/\neUAynIXU7ivICw+qH1EFYoZTtob1DpzEKEUsa2KVCVV4EfUprC9+4kHT469WMOwS\nmCPiU2KJfGi3olZQ6AS81f3EfOn3cty3RdtgOnocgHKFlGXwD4U6XPTLMwkDWqPW\nJglekmBD9Uz3j20Dg4Hh7wCmmqn2Jj1E65dHUctp3Yp8AI5gC6MU448BRiXnOUAZ\nTC/GSLWTBGcaFRr7OZya8nJC/jo1+x5um66JPbvEQwegnKDv9vw6MT//7OXwT1Kr\n7GftlYCbpfgivFFhTphcTHvtVdpQJpwMnl2+CdAcB2G3nOD1e21NzqWqjhSRoxlU\nOb7ENv6zPbLgUJyEDJLaGtH2tTcFt+bHXE5r5t21H50g0DBXX3GrJeXh4LEA6BPW\nFL0xTPfqO1wvyZ4z+BpmAMKL32tv1FM8poPHvVO8m636WQhTKhJ/gdnex/h9yP2p\n5THwjUG9OC+OERrgojgt+oXo17V+HvSwxkW5XOMxYzPXHI9satJvWv2nEbjM/EFL\nzoEpEpIuwoExlL4nGphICn/OjLxsyckiC7q1X87MGTorm1tOFoc8Kyu81HhRkjsJ\nhP14D3mv1JKe+q6+v3mY\n=v2O3\n-----END PGP SIGNATURE-----\n",
+      "payload": "tree f855e2d934576306c098c58fada83ceb2dd3e8fa\nparent 501c29d9e0b7f7b393e36c4177ec2b141a253114\nparent ec1a9d2d730a466bc6c56cc98330d69106597352\nauthor Vishal Bakshi <vdbakshi@gmail.com> 1760467811 -0700\ncommitter GitHub <noreply@github.com> 1760467811 -0700\n\nMerge pull request #405 from robinnarsinghranabhat/bugfix/multigpu-data\n\nbugfix : Incorrect sample division for \"Single-Node, Multi-GPU\" ddp training\n\nHandles sample division in colbert/data/examples.py with:\n\n```python\n[self.data[idx + rank] for idx in range(0, len(self.data), nranks) if idx + rank < len(self.data)]\n```",
+      "verified_at": "2025-10-14T18:50:11Z"
+    }
+  },
+  "url": "https://api.github.com/repos/stanford-futuredata/ColBERT/commits/cc4f3dc91c0b45d2d08c251d9d95178285c65f1c",
+  "html_url": "https://github.com/stanford-futuredata/ColBERT/commit/cc4f3dc91c0b45d2d08c251d9d95178285c65f1c",
+  "comments_url": "https://api.github.com/repos/stanford-futuredata/ColBERT/commits/cc4f3dc91c0b45d2d08c251d9d95178285c65f1c/comments",
+  "author": {
+    "login": "vishalbakshi",
+    "id": 28925987,
+    "node_id": "MDQ6VXNlcjI4OTI1OTg3",
+    "avatar_url": "https://avatars.githubusercontent.com/u/28925987?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/vishalbakshi",
+    "html_url": "https://github.com/vishalbakshi",
+    "followers_url": "https://api.github.com/users/vishalbakshi/followers",
+    "following_url": "https://api.github.com/users/vishalbakshi/following{/other_user}",
+    "gists_url": "https://api.github.com/users/vishalbakshi/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/vishalbakshi/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/vishalbakshi/subscriptions",
+    "organizations_url": "https://api.github.com/users/vishalbakshi/orgs",
+    "repos_url": "https://api.github.com/users/vishalbakshi/repos",
+    "events_url": "https://api.github.com/users/vishalbakshi/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/vishalbakshi/received_events",
+    "type": "User",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "committer": {
+    "login": "web-flow",
+    "id": 19864447,
+    "node_id": "MDQ6VXNlcjE5ODY0NDQ3",
+    "avatar_url": "https://avatars.githubusercontent.com/u/19864447?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/web-flow",
+    "html_url": "https://github.com/web-flow",
+    "followers_url": "https://api.github.com/users/web-flow/followers",
+    "following_url": "https://api.github.com/users/web-flow/following{/other_user}",
+    "gists_url": "https://api.github.com/users/web-flow/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/web-flow/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/web-flow/subscriptions",
+    "organizations_url": "https://api.github.com/users/web-flow/orgs",
+    "repos_url": "https://api.github.com/users/web-flow/repos",
+    "events_url": "https://api.github.com/users/web-flow/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/web-flow/received_events",
+    "type": "User",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "parents": [
+    {
+      "sha": "501c29d9e0b7f7b393e36c4177ec2b141a253114",
+      "url": "https://api.github.com/repos/stanford-futuredata/ColBERT/commits/501c29d9e0b7f7b393e36c4177ec2b141a253114",
+      "html_url": "https://github.com/stanford-futuredata/ColBERT/commit/501c29d9e0b7f7b393e36c4177ec2b141a253114"
+    },
+    {
+      "sha": "ec1a9d2d730a466bc6c56cc98330d69106597352",
+      "url": "https://api.github.com/repos/stanford-futuredata/ColBERT/commits/ec1a9d2d730a466bc6c56cc98330d69106597352",
+      "html_url": "https://github.com/stanford-futuredata/ColBERT/commit/ec1a9d2d730a466bc6c56cc98330d69106597352"
+    }
+  ],
+  "stats": {
+    "total": 2,
+    "additions": 1,
+    "deletions": 1
+  },
+  "files": [
+    {
+      "sha": "074659aca584991740d9444381109673462907ca",
+      "filename": "colbert/data/examples.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/stanford-futuredata/ColBERT/blob/cc4f3dc91c0b45d2d08c251d9d95178285c65f1c/colbert%2Fdata%2Fexamples.py",
+      "raw_url": "https://github.com/stanford-futuredata/ColBERT/raw/cc4f3dc91c0b45d2d08c251d9d95178285c65f1c/colbert%2Fdata%2Fexamples.py",
+      "contents_url": "https://api.github.com/repos/stanford-futuredata/ColBERT/contents/colbert%2Fdata%2Fexamples.py?ref=cc4f3dc91c0b45d2d08c251d9d95178285c65f1c",
+      "patch": "@@ -41,7 +41,7 @@ def tolist(self, rank=None, nranks=None):\n \n         if rank or nranks:\n             assert rank in range(nranks), (rank, nranks)\n-            return [self.data[idx] for idx in range(0, len(self.data), nranks)]  # if line_idx % nranks == rank\n+            return [self.data[idx + rank] for idx in range(0, len(self.data), nranks) if idx + rank < len(self.data)] # if line_idx % nranks == rank\n \n         return list(self.data)\n "
+    }
+  ]
+}

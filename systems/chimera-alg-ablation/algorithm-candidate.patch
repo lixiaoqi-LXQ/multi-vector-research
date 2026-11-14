@@ -1,0 +1,600 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -61,6 +61,7 @@
+     cpp/src/kernels.cu
+     cpp/src/quantization.cpp
+     cpp/src/cpu_scoring.cpp
++    cpp/src/flat_l2_router.cu
+     cpp/src/search_impl.cu
+     cpp/src/utils.cu
+ )
+@@ -110,3 +111,12 @@
+     target_link_libraries(chimera PRIVATE chimera_core)
+     set_target_properties(chimera PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+ endif()
++
++# Isolated correctness executables; compilation never starts CUDA work.
++add_executable(algorithm_flat_qualification ../qa_flat.cpp)
++target_link_libraries(algorithm_flat_qualification PRIVATE chimera_core)
++set_target_properties(algorithm_flat_qualification PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
++add_executable(algorithm_pipeline_qualification ../qa_pipeline.cpp)
++target_include_directories(algorithm_pipeline_qualification PRIVATE cpp/src)
++target_link_libraries(algorithm_pipeline_qualification PRIVATE chimera_core)
++set_target_properties(algorithm_pipeline_qualification PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+--- a/cpp/apps/search.cpp
++++ b/cpp/apps/search.cpp
+@@ -95,6 +95,17 @@
+         return 1;
+     }
+ 
++    const char* variant = args.options.algorithm_variant == AlgorithmVariant::Full ? "full" :
++        args.options.algorithm_variant == AlgorithmVariant::NoCR ? "no-cr" :
++        args.options.algorithm_variant == AlgorithmVariant::NoIVFPG ? "no-ivf-pg" : "neither";
++    std::cout << "[VARIANT] algorithm_variant=" << variant
++              << " kernel_mode=full use_lut=1 use_aggregation=1\n";
++    std::cout << "[ALGORITHM_ABLATION] kernel_mode=full variant=" << variant
++              << " expected_coarse_clusters=" << args.options.expected_coarse_clusters
++              << " route=" << (uses_flat_centroid_route(args.options.algorithm_variant) ? "exact_FP32_PEDANTIC_L2Expanded" : "original_CAGRA")
++              << " candidate_refinement=" << (skips_candidate_refinement(args.options.algorithm_variant) ? "bypassed_all_CG_documents" : "original_partial_sum_topK")
++              << " graph_storage=" << (uses_flat_centroid_route(args.options.algorithm_variant) ? "retained_dataset_container_not_queried" : "original") << '\n';
++
+     size_t num_q = 0;
+     size_t d = 0;
+     size_t query_length = 0;
+--- a/cpp/apps/utils.cpp
++++ b/cpp/apps/utils.cpp
+@@ -28,6 +28,16 @@
+ }
+ 
+ void validate_search_options(const SearchOptions& options) {
++    const auto variant = static_cast<int>(options.algorithm_variant);
++    if (variant < static_cast<int>(AlgorithmVariant::Full) || variant > static_cast<int>(AlgorithmVariant::Neither))
++        throw std::invalid_argument("Unknown algorithm ablation enum");
++    if (uses_flat_centroid_route(options.algorithm_variant)) {
++        if (!options.expected_coarse_clusters || options.expected_coarse_clusters > size_t(2147483647))
++            throw std::invalid_argument("Flat algorithm ablation requires a positive int-sized coarse cluster count");
++    } else if (options.expected_coarse_clusters) {
++        throw std::invalid_argument("Coarse cluster declaration is only valid for flat algorithm modes");
++    }
++
+     if (options.nprobe <= 0) {
+         throw std::runtime_error("--nprobe must be > 0");
+     }
+@@ -47,7 +57,7 @@
+     if (options.num_chunks <= 0) {
+         throw std::runtime_error("--num-chunks must be > 0");
+     }
+-    if (options.k_full_bit > options.k_refine) {
++    if (!skips_candidate_refinement(options.algorithm_variant) && options.k_full_bit > options.k_refine) {
+         throw std::runtime_error("--k-full-bit must not exceed --k-refine");
+     }
+ }
+@@ -137,6 +147,18 @@
+             args.nq = std::stoi(require_value(argc, argv, i, arg));
+         } else if (arg == "--warmup") {
+             args.warmup = std::stoi(require_value(argc, argv, i, arg));
++        } else if (arg == "--kernel-mode") {
++            const auto mode = require_value(argc, argv, i, arg);
++            if (mode != "full") throw std::invalid_argument("Algorithm candidate implements only kernel-mode full");
++        } else if (arg == "--algorithm-variant") {
++            const auto value = require_value(argc, argv, i, arg);
++            if (value == "full") args.options.algorithm_variant = AlgorithmVariant::Full;
++            else if (value == "no-cr") args.options.algorithm_variant = AlgorithmVariant::NoCR;
++            else if (value == "no-ivf-pg") args.options.algorithm_variant = AlgorithmVariant::NoIVFPG;
++            else if (value == "neither") args.options.algorithm_variant = AlgorithmVariant::Neither;
++            else throw std::invalid_argument("Unknown algorithm ablation variant: " + value);
++        } else if (arg == "--ablation-coarse-clusters") {
++            args.options.expected_coarse_clusters = std::stoull(require_value(argc, argv, i, arg));
+         } else if (arg == "--nprobe") {
+             args.options.nprobe = std::stoi(require_value(argc, argv, i, arg));
+         } else if (arg == "--k-refine") {
+@@ -174,6 +196,8 @@
+         throw std::runtime_error("--warmup must be >= 0");
+     }
+     validate_search_options(args.options);
++    if (uses_flat_centroid_route(args.options.algorithm_variant) && !args.options.expected_coarse_clusters)
++        throw std::invalid_argument("Flat algorithm ablation requires --ablation-coarse-clusters explicitly");
+     return args;
+ }
+ 
+@@ -213,6 +237,9 @@
+         << defaults.nq << "\n"
+         << "  [--warmup <num_queries>]        Warmup queries. Default: "
+         << defaults.warmup << "\n"
++        << "  [--kernel-mode full]           This algorithm candidate retains full optimized kernels.\n"
++        << "  [--algorithm-variant full|no-cr|no-ivf-pg|neither]  Explicit private algorithm ablation.\n"
++        << "  [--ablation-coarse-clusters <count>]  Required exact cluster count for flat modes.\n"
+         << "  [--nprobe <num_probes>]         IVF clusters probed per query token. Default: "
+         << defaults.options.nprobe << "\n"
+         << "  [--k-refine <count>]            Candidates retained after refinement. Default: "
+--- a/cpp/include/chimera/chimera_index.cuh
++++ b/cpp/include/chimera/chimera_index.cuh
+@@ -47,7 +47,13 @@
+     bool prefault_full_codes = true;
+ };
+ 
++enum class AlgorithmVariant { Full, NoCR, NoIVFPG, Neither };
++inline bool skips_candidate_refinement(AlgorithmVariant v) { return v == AlgorithmVariant::NoCR || v == AlgorithmVariant::Neither; }
++inline bool uses_flat_centroid_route(AlgorithmVariant v) { return v == AlgorithmVariant::NoIVFPG || v == AlgorithmVariant::Neither; }
++
+ struct SearchOptions {
++    AlgorithmVariant algorithm_variant = AlgorithmVariant::Full;
++    size_t expected_coarse_clusters = 0;
+     int nprobe = 128;
+     int k_refine = 3000;
+     int k_full_bit = 300;
+@@ -156,6 +162,7 @@
+     chimera_index& operator=(const chimera_index&) = delete;
+ 
+   private:
++    friend struct AlgorithmAblationQualification;  // Isolated synthetic GPU qualification; no runtime hook.
+     void build_from_view(
+         const FloatInputView& embeddings,
+         size_t dimension,
+--- /dev/null
++++ b/cpp/include/chimera/chunk_partition.hpp
+@@ -0,0 +1,20 @@
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <stdexcept>
++#include <utility>
++namespace Chimera {
++// Preserve original chunk count, ceil size and cumulative-budget denominator.
++inline std::pair<int,int> ceil_chunk_partition(int documents, int requested_chunks) {
++    if (documents < 0 || requested_chunks <= 0) throw std::invalid_argument("Invalid document chunk shape");
++    if (!documents) return {0, 0};
++    const int count = std::min(requested_chunks, documents);
++    return {count, documents / count + (documents % count != 0)};
++}
++inline std::pair<int,int> clamped_chunk_bounds(int documents, int size, int chunk) {
++    if (documents < 0 || size <= 0 || chunk < 0) throw std::invalid_argument("Invalid document chunk range");
++    const int start = int(std::min(int64_t(documents), int64_t(chunk) * size));
++    const int end = int(std::min(int64_t(documents), int64_t(start) + size));
++    return {start, end};
++}
++}
+--- /dev/null
++++ b/cpp/include/chimera/flat_l2_router.cuh
+@@ -0,0 +1,26 @@
++#pragma once
++#include <cuda_runtime.h>
++#include <cstddef>
++#include <cstdint>
++namespace raft { class resources; }
++namespace Chimera {
++// Exact online route over the stored rotated FP32 centroid matrix. No graph search.
++class FlatL2Router {
++ public:
++    FlatL2Router(const float* centroids, size_t rows, size_t dimension, size_t stride, size_t queries);
++    ~FlatL2Router();
++    FlatL2Router(const FlatL2Router&) = delete;
++    FlatL2Router& operator=(const FlatL2Router&) = delete;
++    void search(raft::resources& resources, const float* queries, size_t query_rows,
++                size_t k, float* distances, uint32_t* labels, cudaStream_t stream);
++    size_t scratch_bytes() const { return sizeof(float) * (rows_ * queries_ + rows_ + queries_); }
++ private:
++    const float* centroids_;
++    size_t rows_, dimension_, stride_, queries_;
++    float* scores_ = nullptr;
++    float* centroid_norms_ = nullptr;
++    float* query_norms_ = nullptr;
++    void* blas_ = nullptr;
++    bool norms_ready_ = false;
++};
++}
+--- a/cpp/src/chimera_index.cu
++++ b/cpp/src/chimera_index.cu
+@@ -27,6 +27,16 @@
+ namespace Chimera {
+ 
+ void chimera_index::validate_search_options(const SearchOptions& options) {
++    const auto variant = static_cast<int>(options.algorithm_variant);
++    if (variant < static_cast<int>(AlgorithmVariant::Full) || variant > static_cast<int>(AlgorithmVariant::Neither))
++        throw std::invalid_argument("Unknown algorithm ablation enum");
++    if (uses_flat_centroid_route(options.algorithm_variant)) {
++        if (!options.expected_coarse_clusters || options.expected_coarse_clusters > size_t(2147483647))
++            throw std::invalid_argument("Flat algorithm ablation requires a positive int-sized coarse cluster count");
++    } else if (options.expected_coarse_clusters) {
++        throw std::invalid_argument("Coarse cluster declaration is only valid for flat algorithm modes");
++    }
++
+     if (options.nprobe <= 0 || options.k_refine <= 0 ||
+         options.k_full_bit <= 0 || options.cagra_itopk_size <= 0 ||
+         options.num_chunks <= 0) {
+@@ -37,7 +47,7 @@
+             "nprobe must not exceed candidate refinement limit " +
+             std::to_string(kCandidateRefinementMaxNprobe));
+     }
+-    if (options.k_full_bit > options.k_refine) {
++    if (!skips_candidate_refinement(options.algorithm_variant) && options.k_full_bit > options.k_refine) {
+         throw std::invalid_argument("k_full_bit must not exceed k_refine");
+     }
+ }
+@@ -298,8 +308,27 @@
+                               n * sizeof(uint32_t), cudaMemcpyHostToDevice));
+     }
+ 
++    if (uses_flat_centroid_route(options_.algorithm_variant)) {
++        if (!options_.expected_coarse_clusters || n_clusters != options_.expected_coarse_clusters)
++            throw std::invalid_argument("Flat algorithm ablation requires the explicitly declared coarse cluster count");
++        const auto& graph = *ivf->pg_index->index_cagra;
++        if (graph.size() != n_clusters || graph.dim() != PADDED_DIM)
++            throw std::invalid_argument("Exact flat ablation centroid matrix shape mismatch");
++        if (graph.metric() != cuvs::distance::DistanceType::L2Expanded)
++            throw std::invalid_argument("Exact flat ablation requires the original default L2Expanded metric");
++    }
+     compute_candidate_bounds();
+     allocate_workspace();
++    if (uses_flat_centroid_route(options_.algorithm_variant)) {
++        const auto matrix = ivf->pg_index->index_cagra->dataset();
++        ws_->flat_router = std::make_unique<FlatL2Router>(matrix.data_handle(), n_clusters, PADDED_DIM, matrix.stride(0), Q_DOCLEN);
++    }
++    std::cout << "[ALGORITHM_WORKSPACE] max_CG_documents=" << max_candidate_docs_
++              << " max_DS_documents=" << ws_->max_refined_candidates
++              << " max_DS_tokens=" << ws_->max_refined_tokens
++              << " token_score_bytes=" << ws_->max_refined_tokens * size_t(Q_DOCLEN) * sizeof(float)
++              << " CR_arena=" << (skips_candidate_refinement(options_.algorithm_variant) ? "absent" : "original")
++              << " flat_scratch_bytes=" << (ws_->flat_router ? ws_->flat_router->scratch_bytes() : 0) << '\n';
+     search_ready_ = true;
+ }
+ 
+--- a/cpp/src/chimera_index_internal.cuh
++++ b/cpp/src/chimera_index_internal.cuh
+@@ -3,6 +3,7 @@
+ #include <cuda_runtime.h>
+ 
+ #include "chimera/chimera_index.cuh"
++#include "chimera/flat_l2_router.cuh"
+ 
+ #include <numeric>
+ #include <utility>
+@@ -11,6 +12,7 @@
+ namespace Chimera {
+ 
+ struct chimera_index::Workspace {
++    std::unique_ptr<FlatL2Router> flat_router;
+     float* d_queries = nullptr;
+     float* d_cb1_sumq = nullptr;
+     int* d_refined_doc_lengths = nullptr;
+--- /dev/null
++++ b/cpp/src/flat_l2_router.cu
+@@ -0,0 +1,96 @@
++#include "chimera/flat_l2_router.cuh"
++#include "chimera/chimera_index.cuh"
++#include <cublas_v2.h>
++#include <raft/matrix/select_k.cuh>
++#include <raft/core/resource/cuda_stream.hpp>
++#include <rmm/cuda_stream_view.hpp>
++#include <limits>
++#include <optional>
++#include <stdexcept>
++#include <string>
++namespace Chimera {
++namespace {
++void blas_check(cublasStatus_t status, const char* operation) {
++    if (status != CUBLAS_STATUS_SUCCESS)
++        throw std::runtime_error(std::string(operation) + " failed, cuBLAS status " + std::to_string(int(status)));
++}
++__global__ void row_norms(const float* matrix, float* norms, int rows, int dimension, int stride) {
++    const int lane = threadIdx.x & 31;
++    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
++    if (row >= rows) return;
++    float sum = 0.0f;
++    for (int d = lane; d < dimension; d += 32) {
++        const float v = matrix[size_t(row) * stride + d];
++        sum = __fmaf_rn(v, v, sum);
++    }
++    for (int offset = 16; offset > 0; offset >>= 1)
++        sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, offset));
++    if (lane == 0) norms[row] = sum;
++}
++__global__ void expanded_l2(float* dots, const float* centroid_norms,
++                           const float* query_norms, size_t rows, size_t count) {
++    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i < count) {
++        const float norm_sum = __fadd_rn(centroid_norms[i % rows], query_norms[i / rows]);
++        dots[i] = fmaxf(0.0f, __fadd_rn(norm_sum, __fmul_rn(-2.0f, dots[i])));
++    }
++}
++}
++FlatL2Router::FlatL2Router(const float* centroids, size_t rows, size_t dimension,
++                         size_t stride, size_t queries)
++    : centroids_(centroids), rows_(rows), dimension_(dimension), stride_(stride), queries_(queries) {
++    if (!centroids || !rows || !dimension || stride < dimension || !queries ||
++        rows > size_t(std::numeric_limits<int>::max()) || stride > size_t(std::numeric_limits<int>::max()) ||
++        dimension > size_t(std::numeric_limits<int>::max()) || queries > size_t(std::numeric_limits<int>::max()) ||
++        rows > std::numeric_limits<size_t>::max() / queries / sizeof(float))
++        throw std::invalid_argument("Invalid flat route matrix shape or allocation overflow");
++    cublasHandle_t handle = nullptr;
++    try {
++        check_cuda(cudaMalloc(&scores_, rows * queries * sizeof(float)));
++        check_cuda(cudaMalloc(&centroid_norms_, rows * sizeof(float)));
++        check_cuda(cudaMalloc(&query_norms_, queries * sizeof(float)));
++        blas_check(cublasCreate(&handle), "Creating exact flat cuBLAS handle");
++        blas_ = handle;
++        blas_check(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH), "Disabling reduced precision math");
++        blas_check(cublasSetAtomicsMode(handle, CUBLAS_ATOMICS_NOT_ALLOWED), "Disabling cuBLAS atomics");
++    } catch (...) {
++        if (handle) (void)cublasDestroy(handle);
++        (void)cudaFree(scores_); (void)cudaFree(centroid_norms_); (void)cudaFree(query_norms_);
++        throw;
++    }
++}
++FlatL2Router::~FlatL2Router() {
++    if (blas_) (void)cublasDestroy(static_cast<cublasHandle_t>(blas_));
++    (void)cudaFree(scores_); (void)cudaFree(centroid_norms_); (void)cudaFree(query_norms_);
++}
++void FlatL2Router::search(raft::resources& resources, const float* queries, size_t query_rows,
++                          size_t k, float* distances, uint32_t* labels, cudaStream_t stream) {
++    if (query_rows != queries_ || !queries || !k || k > rows_ || !distances || !labels)
++        throw std::invalid_argument("Invalid exact flat query or top-k shape");
++    auto handle = static_cast<cublasHandle_t>(blas_);
++    blas_check(cublasSetStream(handle, stream), "Setting exact flat stream");
++    raft::resource::set_cuda_stream(resources, rmm::cuda_stream_view(stream));
++    if (!norms_ready_) {
++        row_norms<<<(rows_ + 3) / 4, 128, 0, stream>>>(centroids_, centroid_norms_, int(rows_), int(dimension_), int(stride_));
++        check_cuda(cudaGetLastError()); norms_ready_ = true;
++    }
++    row_norms<<<(queries_ + 3) / 4, 128, 0, stream>>>(queries, query_norms_, int(queries_), int(dimension_), int(dimension_));
++    check_cuda(cudaGetLastError());
++    const float alpha = 1.0f, beta = 0.0f;
++    // Row-major [Q,C] is column-major [C,Q]. A is row-major [C,D].
++    blas_check(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
++        int(rows_), int(queries_), int(dimension_), &alpha,
++        centroids_, CUDA_R_32F, int(stride_), queries, CUDA_R_32F, int(dimension_),
++        &beta, scores_, CUDA_R_32F, int(rows_), CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT),
++        "Exact FP32 flat centroid GEMM");
++    const size_t count = rows_ * queries_;
++    expanded_l2<<<(count + 255) / 256, 256, 0, stream>>>(scores_, centroid_norms_, query_norms_, rows_, count);
++    check_cuda(cudaGetLastError());
++    raft::matrix::select_k<float, uint32_t>(resources,
++        raft::make_device_matrix_view<const float, int64_t>(scores_, queries_, rows_),
++        std::nullopt,
++        raft::make_device_matrix_view<float, int64_t>(distances, queries_, k),
++        raft::make_device_matrix_view<uint32_t, int64_t>(labels, queries_, k),
++        true, true, raft::matrix::SelectAlgo::kAuto);
++}
++}
+--- a/cpp/src/search_impl.cu
++++ b/cpp/src/search_impl.cu
+@@ -9,6 +9,7 @@
+ #define EIGEN_NO_CUDA
+ 
+ #include "chimera/config.cuh"
++#include "chimera/chunk_partition.hpp"
+ #include "chimera/profiling.hpp"
+ #include "chimera/ivf_pg.hpp"
+ #include "chimera/kernels.cuh"
+@@ -132,6 +133,9 @@
+ 
+     {
+     ProfileRange route(profiling_enabled_, "Chimera/route");
++    if (uses_flat_centroid_route(options_.algorithm_variant)) {
++        ws_->flat_router->search(*cagra_res_, ws_->d_queries, Q_DOCLEN, nprobe, ws_->d_cagra_dists, ws_->d_cagra_labels, stream);
++    } else {
+     ivf->search_centroids(
+         *cagra_res_,
+         ws_->d_queries,
+@@ -142,6 +146,7 @@
+         stream,
+         static_cast<size_t>(options_.cagra_itopk_size));
+     }
++    }
+ 
+     check_cuda(cudaStreamWaitEvent(stream, ws_->event_h2d_done));
+ 
+@@ -200,6 +205,7 @@
+     }
+ 
+     ensure_candidate_capacity(static_cast<size_t>(num_candidate_docs));
++    if (!skips_candidate_refinement(options_.algorithm_variant))
+     check_cuda(cudaMemsetAsync(ws_->d_partial_query_scores,
+                                0,
+                                static_cast<size_t>(num_candidate_docs) * Q_DOCLEN * sizeof(float),
+@@ -215,6 +221,15 @@
+             d_candidate_bitmap_offsets_,
+             ws_->d_materialized_candidate_doc_ids);
+     check_cuda(cudaGetLastError());
++
++    if (skips_candidate_refinement(options_.algorithm_variant)) {
++        // True no-CR: every materialized CG document enters unchanged DS.
++        ProfileRange bypass(profiling_enabled_, "Chimera/no_cr_all_candidates", num_candidate_docs);
++        num_refined_candidates = num_candidate_docs;
++        check_cuda(cudaMemcpyAsync(ws_->d_candidate_doc_ids, ws_->d_materialized_candidate_doc_ids,
++                                   size_t(num_candidate_docs) * sizeof(int), cudaMemcpyDeviceToDevice, stream));
++        return;
++    }
+ 
+     partial_score_kernel<<<grid, threads_per_block, 0, stream>>>(
+         ws_->d_lut,
+@@ -274,7 +289,11 @@
+     std::vector<size_t>& result
+ ) {
+     ProfileRange range(profiling_enabled_, "Chimera/collaborative_scoring", num_refined_candidates);
+-    if (num_refined_candidates == 0) return;
++    if (num_refined_candidates == 0) {
++        result.clear();
++        last_result_scores_.clear();
++        return;
++    }
+ 
+     cudaStream_t stream = ws_->stream_compute;
+     cudaStream_t stream_d2h = ws_->stream_d2h;
+@@ -344,10 +363,9 @@
+     while (score_threads < Q_DOCLEN && score_threads < 256) score_threads *= 2;
+     score_threads = std::min(score_threads, 256);
+ 
+-    const int num_chunks =
+-        std::min(options_.num_chunks, num_refined_candidates);
+-    const int chunk_size =
+-        (num_refined_candidates + num_chunks - 1) / num_chunks;
++    const auto partition = ceil_chunk_partition(num_refined_candidates, options_.num_chunks);
++    const int num_chunks = partition.first;
++    const int chunk_size = partition.second;
+ 
+     std::vector<cudaEvent_t> chunk_compute_done(num_chunks);
+     std::vector<cudaEvent_t> chunk_d2h_done(num_chunks);
+@@ -360,9 +378,9 @@
+ 
+     auto launch_chunk_compute = [&](int chunk) {
+         ProfileRange gpu_range(profiling_enabled_, "Chimera/gpu_chunk_submission", chunk);
+-        const int chunk_start = chunk * chunk_size;
+-        const int chunk_end = std::min(
+-            chunk_start + chunk_size, num_refined_candidates);
++        const auto bounds = clamped_chunk_bounds(num_refined_candidates, chunk_size, chunk);
++        const int chunk_start = bounds.first;
++        const int chunk_end = bounds.second;
+         const int chunk_count = chunk_end - chunk_start;
+         const size_t token_start =
+             ws_->h_pinned_refined_doc_offsets[chunk_start];
+@@ -388,6 +406,7 @@
+             check_cuda(cudaGetLastError());
+         }
+ 
++        if (chunk_count > 0) {
+         one_bit_document_score_kernel<<<
+             chunk_count, score_threads, 0, stream>>>(
+             ws_->d_one_bit_token_scores,
+@@ -396,12 +415,13 @@
+             total_tokens,
+             chunk_count);
+         check_cuda(cudaGetLastError());
++        }
+ 
+         check_cuda(cudaEventRecord(chunk_compute_done[chunk], stream));
+ 
+         check_cuda(cudaStreamWaitEvent(
+             stream_d2h, chunk_compute_done[chunk], 0));
+-        check_cuda(cudaMemcpyAsync(
++        if (chunk_count > 0) check_cuda(cudaMemcpyAsync(
+             ws_->h_mapped_one_bit_document_scores + chunk_start,
+             ws_->d_one_bit_document_scores + chunk_start,
+             chunk_count * sizeof(float),
+@@ -424,9 +444,9 @@
+     auto& full_bit_scores = ws_->full_bit_scores;
+ 
+     for (int chunk = 0; chunk < num_chunks; ++chunk) {
+-        const int chunk_start = chunk * chunk_size;
+-        const int chunk_end = std::min(
+-            chunk_start + chunk_size, num_refined_candidates);
++        const auto bounds = clamped_chunk_bounds(num_refined_candidates, chunk_size, chunk);
++        const int chunk_start = bounds.first;
++        const int chunk_end = bounds.second;
+         const int chunk_count = chunk_end - chunk_start;
+         {
+             ProfileRange wait(profiling_enabled_, "Chimera/wait_chunk", chunk);
+@@ -449,7 +469,7 @@
+             one_bit_score_order.begin() + merge_size,
+             descending_one_bit_score);
+         const int cumulative_full_bit_target = std::min(
+-            full_bit_target * (chunk + 1) / num_chunks, carry_size);
++            int((int64_t(full_bit_target) * (chunk + 1)) / num_chunks), carry_size);
+         std::nth_element(
+             one_bit_score_order.begin(),
+             one_bit_score_order.begin() + cumulative_full_bit_target,
+--- a/cpp/src/utils.cu
++++ b/cpp/src/utils.cu
+@@ -145,7 +145,9 @@
+ 
+ size_t candidate_arena_bytes(
+     size_t row_capacity,
+-    size_t score_buffer_capacity) {
++    size_t score_buffer_capacity,
++    bool no_cr) {
++    if (no_cr) return align_up(row_capacity * sizeof(int), kCandidateArenaAlignment) + row_capacity * sizeof(int);
+     size_t offset = 0;
+     offset = align_up(offset, kCandidateArenaAlignment);
+     offset += row_capacity * sizeof(int);
+@@ -196,6 +198,15 @@
+     char* base,
+     size_t row_capacity,
+     size_t score_buffer_capacity) {
++    if (skips_candidate_refinement(options_.algorithm_variant)) {
++        ws_->d_materialized_candidate_doc_ids = reinterpret_cast<int*>(base);
++        ws_->d_candidate_doc_ids = reinterpret_cast<int*>(base + align_up(row_capacity * sizeof(int), kCandidateArenaAlignment));
++        ws_->d_sorted_candidate_doc_ids = nullptr;
++        ws_->d_partial_scores = nullptr;
++        ws_->d_partial_query_scores = nullptr;
++        ws_->d_sorted_partial_scores = nullptr;
++        return;
++    }
+     size_t offset = 0;
+     offset = align_up(offset, kCandidateArenaAlignment);
+     ws_->d_sorted_candidate_doc_ids = reinterpret_cast<int*>(base + offset);
+@@ -282,7 +293,7 @@
+     const size_t score_buffer_capacity =
+         std::max(grown_rows, ws_->max_refined_candidates);
+     const size_t required_buffer_bytes =
+-        candidate_arena_bytes(grown_rows, score_buffer_capacity);
++        candidate_arena_bytes(grown_rows, score_buffer_capacity, skips_candidate_refinement(options_.algorithm_variant));
+ 
+     check_cuda(cudaFree(d_candidate_arena_raw_));
+     d_candidate_arena_raw_ = nullptr;
+@@ -299,10 +310,7 @@
+ }
+ 
+ void chimera_index::allocate_workspace() {
+-    ws_->max_refined_candidates = options_.k_refine;
+     ws_->max_full_bit_candidates = options_.k_full_bit;
+-    ws_->max_refined_tokens =
+-        compute_refined_token_bound(doc_ptrs_, ws_->max_refined_candidates);
+     const size_t max_scored_candidate_docs = std::min(
+         static_cast<size_t>(num_docs),
+         max_retrieved_tokens_per_query_ * Q_DOCLEN);
+@@ -310,6 +318,9 @@
+     max_candidate_docs_ = std::min(
+         static_cast<size_t>(num_docs),
+         max_candidate_docs_per_query_ * Q_DOCLEN);
++    ws_->max_refined_candidates = skips_candidate_refinement(options_.algorithm_variant)
++        ? max_candidate_docs_ : size_t(options_.k_refine);
++    ws_->max_refined_tokens = compute_refined_token_bound(doc_ptrs_, ws_->max_refined_candidates);
+     candidate_bitmap_bucket_count_ = candidate_bitmap_num_buckets(num_docs);
+     candidate_bitmap_offset_count_ =
+         candidate_bitmap_num_offsets(candidate_bitmap_bucket_count_);
+@@ -337,8 +348,8 @@
+         doc_lengths_bytes +
+         candidate_rows * sizeof(int) +
+         candidate_rows * sizeof(int) +
+-        candidate_rows * sizeof(float) +
+-        candidate_rows * Q_DOCLEN * sizeof(float) +
++        (skips_candidate_refinement(options_.algorithm_variant) ? 0 : candidate_rows * sizeof(float)) +
++        (skips_candidate_refinement(options_.algorithm_variant) ? 0 : candidate_rows * Q_DOCLEN * sizeof(float)) +
+         candidate_bitmap_bucket_count_ * sizeof(candidate_bitmap_bucket_t) +
+         candidate_bitmap_offset_count_ * sizeof(candidate_bitmap_offset_t);
+     configure_cagra_workspace(*cagra_res_, estimated_size);
+@@ -359,6 +370,7 @@
+     candidate_capacity_ = 0;
+     size_t temp_bytes = 0;
+ 
++    if (!skips_candidate_refinement(options_.algorithm_variant)) {
+     temp_bytes = 0;
+     cub::DeviceRadixSort::SortPairsDescending(
+         nullptr,
+@@ -371,7 +383,7 @@
+         0,
+         32);
+     ws_->cub_temp_storage_bytes = std::max(ws_->cub_temp_storage_bytes, temp_bytes);
+-
++    }
+ 
+     {
+         thrust::device_ptr<int> len_ptr(ws_->d_refined_doc_lengths);
+@@ -434,7 +446,7 @@
+                               ws_->max_refined_candidates * sizeof(int)));
+     check_cuda(cudaMallocHost(&ws_->h_num_refined_tokens, sizeof(size_t)));
+ 
+-    check_cuda(cudaMemset(
++    if (!skips_candidate_refinement(options_.algorithm_variant)) check_cuda(cudaMemset(
+         ws_->d_partial_query_scores,
+         0,
+         candidate_rows * Q_DOCLEN * sizeof(float)));
+@@ -481,6 +493,8 @@
+         (void)cudaDeviceSynchronize();
+     }
+ 
++    // Release exact-flat asynchronous users before their borrowed centroid storage.
++    if (ws_) ws_->flat_router.reset();
+     delete ivf;
+     ivf = nullptr;
+     cagra_res_.reset();

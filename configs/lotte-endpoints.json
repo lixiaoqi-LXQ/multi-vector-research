@@ -1,0 +1,75 @@
+{
+  "dataset": "LoTTE pooled dev full",
+  "queries": 2931,
+  "batch_size": 1,
+  "threads": 20,
+  "rounds": 3,
+  "warmup_queries": 32,
+  "query_holdout": false,
+  "points": [
+    {
+      "topk": 10,
+      "recall_target": 0.9,
+      "chimera_and_chimera_plus": {
+        "nprobe": 32,
+        "k_refine": 1000,
+        "k_full_bit": 20,
+        "cagra_itopk_size": 64,
+        "chunks": 1
+      },
+      "plaid_native": {
+        "ncells": 1,
+        "ndocs": 1024,
+        "centroid_score_threshold": 0.45
+      }
+    },
+    {
+      "topk": 10,
+      "recall_target": 0.95,
+      "chimera_and_chimera_plus": {
+        "nprobe": 128,
+        "k_refine": 1000,
+        "k_full_bit": 50,
+        "cagra_itopk_size": 160,
+        "chunks": 1
+      },
+      "plaid_native": {
+        "ncells": 4,
+        "ndocs": 4096,
+        "centroid_score_threshold": 0.45
+      }
+    },
+    {
+      "topk": 100,
+      "recall_target": 0.9,
+      "chimera_and_chimera_plus": {
+        "nprobe": 64,
+        "k_refine": 3000,
+        "k_full_bit": 300,
+        "cagra_itopk_size": 96,
+        "chunks": 1
+      },
+      "plaid_native": {
+        "ncells": 2,
+        "ndocs": 4096,
+        "centroid_score_threshold": 0.45
+      }
+    },
+    {
+      "topk": 100,
+      "recall_target": 0.95,
+      "chimera_and_chimera_plus": {
+        "nprobe": 256,
+        "k_refine": 3000,
+        "k_full_bit": 300,
+        "cagra_itopk_size": 288,
+        "chunks": 1
+      },
+      "plaid_native": {
+        "ncells": 4,
+        "ndocs": 8192,
+        "centroid_score_threshold": 0.45
+      }
+    }
+  ]
+}
