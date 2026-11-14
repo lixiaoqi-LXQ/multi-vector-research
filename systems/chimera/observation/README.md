@@ -1,0 +1,9 @@
+# Independent observation build
+
+This copy adds only two NVTX child ranges to the qualified owned-device/checkpoint source. It never changes the active source, construction process or QPS binary. `candidate_generation` covers bitmap initialization, route, mark/count/scan and the existing candidate-count synchronization. `candidate_refinement` covers materialization, partial score, sum, sort and refined-ID copy. Existing profile switch controls both; no CUDA calls/synchronization/scoring logic was added.
+
+Actual fullbit work already exists as `Chimera/cpu_fullbit` INT64 payload. The parser groups it under the query scope and the preceding `wait_chunk` payload, preserves zero-work chunks, and sums per-query Khat. It does not substitute configured k_full_bit: the CPU fixture has nominal8 and actual[4,0,8], Khat12. Nine invalid traces reject, including missing payload, orphan/overlapping ranges and repeated chunks. SQLite opens read-only; the installed Nsight2025.3.2 exporter contains NVTX_EVENTS/int64Value. Real capture compatibility and output equivalence remain future GPU validation.
+
+After full calibration freezes one point, use `generate_profiles.py --final-spec FINAL.json --out NEW_DIR`. It prepares chunks1/2/4/6/8/10,32-query captures, original query-row bindings and explicit offline SQLite/export/parser commands. Preparation never launches GPU. The existing profile helper requires exclusive GPU lock and10s idle. First run original versus observation output equivalence on the same audited index in that future dedicated window.
+
+Host NVTX durations describe submission, wait and CPU scopes. GPU stage times require CUDA interval/correlation analysis; do not sum overlapping host ranges or treat logical copy bytes as physical DRAM traffic. Khat counts document evaluations, not tokens/FLOPs or DRAM bytes.

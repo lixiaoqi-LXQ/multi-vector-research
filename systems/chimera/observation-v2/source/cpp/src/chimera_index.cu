@@ -1,0 +1,335 @@
+#include "chimera/spilled_full_codes.hpp"
+#include <cuda_runtime.h>
+
+#include "chimera/chimera_index.cuh"
+
+#define EIGEN_NO_CUDA
+
+#include "chimera/config.cuh"
+#include "chimera/io.hpp"
+#include "chimera/index_file_io.hpp"
+#include "chimera/ivf_pg.hpp"
+#include "chimera/quantization.hpp"
+#include "chimera_index_internal.cuh"
+#include "rabitqlib/utils/rotator.hpp"
+
+#include <raft/core/resources.hpp>
+
+#include <filesystem>
+#include <chrono>
+#include <iostream>
+#include <fstream>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+namespace Chimera {
+
+void chimera_index::validate_search_options(const SearchOptions& options) {
+    const auto variant = static_cast<int>(options.algorithm_variant);
+    if (variant < static_cast<int>(AlgorithmVariant::Full) || variant > static_cast<int>(AlgorithmVariant::Neither))
+        throw std::invalid_argument("Unknown algorithm ablation enum");
+    if (uses_flat_centroid_route(options.algorithm_variant)) {
+        if (!options.expected_coarse_clusters || options.expected_coarse_clusters > size_t(2147483647))
+            throw std::invalid_argument("Flat algorithm ablation requires a positive int-sized coarse cluster count");
+    } else if (options.expected_coarse_clusters) {
+        throw std::invalid_argument("Coarse cluster declaration is only valid for flat algorithm modes");
+    }
+
+    if (options.nprobe <= 0 || options.k_refine <= 0 ||
+        options.k_full_bit <= 0 || options.cagra_itopk_size <= 0 ||
+        options.num_chunks <= 0) {
+        throw std::invalid_argument("All Chimera search options must be positive");
+    }
+    if (options.nprobe > kCandidateRefinementMaxNprobe) {
+        throw std::invalid_argument(
+            "nprobe must not exceed candidate refinement limit " +
+            std::to_string(kCandidateRefinementMaxNprobe));
+    }
+    if (!skips_candidate_refinement(options.algorithm_variant) && options.k_full_bit > options.k_refine) {
+        throw std::invalid_argument("k_full_bit must not exceed k_refine");
+    }
+}
+
+chimera_index::chimera_index() = default;
+
+void chimera_index::begin_initialization(const SearchOptions& options) {
+    release_resources();
+    options_ = options;
+    validate_search_options(options_);
+    cagra_res_ = std::make_unique<raft::resources>();
+    ws_ = std::make_unique<Workspace>();
+}
+
+chimera_index::~chimera_index() {
+    release_resources();
+}
+
+void chimera_index::load(
+    const std::string& index_dir,
+    const SearchOptions& options) {
+    load(index_dir, options, LoadOptions {});
+}
+
+void chimera_index::load(
+    const std::string& index_dir,
+    const SearchOptions& options,
+    const LoadOptions& load_options) {
+    validate_search_options(options);
+    if (load_options.transfer_chunk_bytes == 0) {
+        throw std::invalid_argument("Load transfer_chunk_bytes must be positive");
+    }
+    const std::filesystem::path directory(index_dir);
+    if (!std::filesystem::is_directory(directory)) {
+        throw std::runtime_error(
+            "Chimera index directory does not exist: " + index_dir);
+    }
+
+    int device_count = 0;
+    check_cuda(cudaGetDeviceCount(&device_count), "Querying CUDA devices");
+    if (device_count == 0) {
+        throw std::runtime_error("No CUDA device is available");
+    }
+    check_cuda(cudaSetDevice(0), "Selecting CUDA device 0");
+    begin_initialization(options);
+    load_options_ = load_options;
+    low_memory_load_ = load_options.low_memory;
+    load_directory_ = std::filesystem::absolute(directory).string();
+    if (low_memory_load_) {
+        // release_resources clears vector sizes; drop capacities from a previous
+        // ordinary load too so switching modes on the same object saves memory.
+        std::vector<char>().swap(full_bit_codes_);
+        std::vector<uint64_t>().swap(one_bit_codes_);
+        std::vector<float>().swap(one_bit_factors_);
+        std::vector<char>().swap(clustered_data_);
+        std::vector<float>().swap(full_bit_factors_);
+    }
+
+    const auto doclens_path = (directory / "doclens.bin").string();
+    const auto doc_one_bit_path = (directory / "doc_1bit.bin").string();
+    const auto doc_full_path = (directory / "doc_full.bin").string();
+    const auto cluster_one_bit_path =
+        (directory / "cluster_1bit.bin").string();
+    const auto ivf_path = (directory / "ivf.bin").string();
+    const auto centroids_path = (directory / "centroids.carga").string();
+
+    std::ifstream inf(doc_one_bit_path, std::ios::binary);
+    IndexHeader header {};
+    inf.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!inf || header.num_embeddings == 0 ||
+        header.num_embeddings > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        header.dimension < 64 || header.dimension > PADDED_DIM ||
+        header.num_clusters == 0 ||
+        header.num_clusters > header.num_embeddings ||
+        header.ex_bits < 1 || header.ex_bits > 7) {
+        throw std::runtime_error("Invalid Chimera index header: " + doc_one_bit_path);
+    }
+    n = header.num_embeddings;
+    d = header.dimension;
+    n_clusters = header.num_clusters;
+    ex_bits = header.ex_bits;
+    if (static_cast<size_t>(options_.nprobe) > n_clusters) {
+        throw std::invalid_argument("nprobe must not exceed the number of clusters");
+    }
+
+    if (header.padded_dimension != PADDED_DIM) {
+        throw std::runtime_error(
+            "Index file padded_dim=" +
+            std::to_string(header.padded_dimension) +
+            " does not match compiled PADDED_DIM=" + std::to_string(PADDED_DIM) +
+            ". Please recompile with matching PADDED_DIM in chimera/config.cuh"
+        );
+    }
+
+    rotator_ = rabitqlib::choose_rotator<float>(
+        d,
+        rabitqlib::RotatorType::FhtKacRotator,
+        header.padded_dimension);
+    rotator_->load(inf);
+    if (!inf) {
+        delete rotator_;
+        rotator_ = nullptr;
+        throw std::runtime_error("Failed to read rotator from " + doc_one_bit_path);
+    }
+
+    full_bit_factors_.resize(n);
+    if (low_memory_load_) {
+        // doc_1bit.bin after its rotator stores codes[16*N], one-bit
+        // factors[4*N], then CPU full-bit factors[4*N]. Search uses only
+        // the last segment on CPU; GPU 1-bit data comes from cluster_1bit.bin.
+        const size_t skip = n * (PADDED_DIM / 8 + sizeof(float));
+        inf.seekg(static_cast<std::streamoff>(skip), std::ios::cur);
+    } else {
+        one_bit_codes_.resize(n * (PADDED_DIM / 64));
+        one_bit_factors_.resize(n);
+        inf.read(reinterpret_cast<char*>(one_bit_codes_.data()),
+                 static_cast<std::streamsize>(one_bit_codes_.size() * sizeof(uint64_t)));
+        inf.read(reinterpret_cast<char*>(one_bit_factors_.data()),
+                 static_cast<std::streamsize>(one_bit_factors_.size() * sizeof(float)));
+    }
+    inf.read(reinterpret_cast<char*>(full_bit_factors_.data()),
+             static_cast<std::streamsize>(full_bit_factors_.size() * sizeof(float)));
+    if (!inf) {
+        throw std::runtime_error("Failed to read quantized payload from " + doc_one_bit_path);
+    }
+    const size_t full_code_bytes = n * PADDED_DIM * (1 + ex_bits) / 8;
+    if (low_memory_load_) {
+        mapped_full_bit_codes_ = std::make_unique<ReadOnlyMappedFile>(doc_full_path, full_code_bytes);
+        mapped_full_bit_data_ = mapped_full_bit_codes_->data();
+        if (load_options_.prefault_full_codes) {
+            const auto prefault_begin = std::chrono::steady_clock::now();
+            mapped_full_bit_codes_->prefault();
+            const double prefault_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - prefault_begin).count();
+            std::cout << "[PREFAULT] bytes=" << full_code_bytes
+                      << " elapsed_ms=" << prefault_ms << '\n';
+        }
+    } else {
+        full_bit_codes_.resize(full_code_bytes);
+        std::ifstream full_bit_codes_file(doc_full_path, std::ios::binary);
+        full_bit_codes_file.read(full_bit_codes_.data(), full_bit_codes_.size());
+        if (!full_bit_codes_file) {
+            throw std::runtime_error("Failed to read full-code payload from " + doc_full_path);
+        }
+    }
+    ivf = new IVF_PG(n_clusters, d);
+    ivf->load(ivf_path, centroids_path);
+    doc_lens_ = load_doclens(doclens_path);
+
+    const size_t clustered_bytes =
+        n * (PADDED_DIM / 8 + sizeof(float) + sizeof(int) + sizeof(uint32_t));
+    std::ifstream clustered_file(
+        cluster_one_bit_path,
+        std::ios::binary | std::ios::ate);
+    if (!clustered_file || clustered_file.tellg() < 0 ||
+        static_cast<size_t>(clustered_file.tellg()) != clustered_bytes) {
+        throw std::runtime_error(
+            "Invalid clustered index payload: " + cluster_one_bit_path);
+    }
+    if (!low_memory_load_) {
+        clustered_data_.resize(clustered_bytes);
+        clustered_file.seekg(0);
+        clustered_file.read(clustered_data_.data(),
+                            static_cast<std::streamsize>(clustered_data_.size()));
+        if (!clustered_file) {
+            throw std::runtime_error("Failed to read clustered index: " + cluster_one_bit_path);
+        }
+    }
+
+    has_index_ = true;
+    try {
+        initialize_search_state();
+    } catch (...) {
+        release_resources();
+        throw;
+    }
+}
+
+void chimera_index::initialize_search_state() {
+    if (search_ready_) {
+        return;
+    }
+    if (!has_index_ || ivf == nullptr || rotator_ == nullptr || ws_ == nullptr) {
+        throw std::runtime_error("Cannot initialize an empty Chimera index");
+    }
+    if (static_cast<size_t>(options_.nprobe) > n_clusters) {
+        throw std::invalid_argument("nprobe must not exceed the number of clusters");
+    }
+
+    unpack_func_ = rabitqlib::select_excode_unpackfunc(1 + ex_bits);
+    max_cluster_size = ivf->max_cluster_size();
+    set_doc_mapping(doc_lens_);
+
+    check_cuda(cudaMalloc(&d_doc_ptrs_, (num_docs + 1) * sizeof(int)));
+    check_cuda(cudaMalloc(&d_cluster_pos_, (ivf->n_clusters + 1) * sizeof(size_t)));
+    check_cuda(cudaMemcpy(
+        d_cluster_pos_,
+        ivf->cluster_pos.data(),
+        (ivf->n_clusters + 1) * sizeof(size_t),
+        cudaMemcpyHostToDevice));
+    check_cuda(cudaMemcpy(
+        d_doc_ptrs_,
+        doc_ptrs_.data(),
+        (num_docs + 1) * sizeof(int),
+        cudaMemcpyHostToDevice));
+
+    const size_t code_per_vec = PADDED_DIM / 8;
+    const size_t expected_clustered_bytes =
+        n * (code_per_vec + sizeof(float) + sizeof(int) + sizeof(uint32_t));
+    if (!low_memory_load_ && clustered_data_.size() != expected_clustered_bytes) {
+        throw std::runtime_error("Invalid in-memory clustered index payload");
+    }
+
+    size_t free_mem = 0;
+    [[maybe_unused]] size_t total_mem = 0;
+    check_cuda(cudaMemGetInfo(&free_mem, &total_mem));
+    if (free_mem <= expected_clustered_bytes) {
+        throw std::runtime_error(
+            "Insufficient GPU memory for clustered index: need " +
+            std::to_string(expected_clustered_bytes) + " bytes, have " +
+            std::to_string(free_mem) + " bytes free");
+    }
+
+    check_cuda(cudaMalloc(&d_clustered_one_bit_codes_, n * code_per_vec));
+    check_cuda(cudaMalloc(&d_clustered_one_bit_factors_, n * sizeof(float)));
+    check_cuda(cudaMalloc(&d_clustered_doc_ids_, n * sizeof(int)));
+    check_cuda(cudaMalloc(&d_token_to_cluster_pos_, n * sizeof(uint32_t)));
+
+    if (low_memory_load_) {
+        const auto path = (std::filesystem::path(load_directory_) / "cluster_1bit.bin").string();
+        const std::vector<size_t> sizes = {
+            n * code_per_vec, n * sizeof(float), n * sizeof(int), n * sizeof(uint32_t)};
+        char* destinations[] = {
+            d_clustered_one_bit_codes_,
+            reinterpret_cast<char*>(d_clustered_one_bit_factors_),
+            reinterpret_cast<char*>(d_clustered_doc_ids_),
+            reinterpret_cast<char*>(d_token_to_cluster_pos_)};
+        stream_index_segments(path, sizes, load_options_.transfer_chunk_bytes,
+            [&](size_t segment, size_t offset, const char* data, size_t count) {
+                check_cuda(cudaMemcpy(destinations[segment] + offset, data, count,
+                                      cudaMemcpyHostToDevice));
+            });
+    } else {
+        const char* clustered_code = clustered_data_.data();
+        const auto* clustered_factor = reinterpret_cast<const float*>(
+            clustered_code + n * code_per_vec);
+        const auto* clustered_doc_ids = reinterpret_cast<const int*>(
+            reinterpret_cast<const char*>(clustered_factor) + n * sizeof(float));
+        const auto* token_to_cluster_pos = reinterpret_cast<const uint32_t*>(
+            reinterpret_cast<const char*>(clustered_doc_ids) + n * sizeof(int));
+        check_cuda(cudaMemcpy(d_clustered_one_bit_codes_, clustered_code,
+                              n * code_per_vec, cudaMemcpyHostToDevice));
+        check_cuda(cudaMemcpy(d_clustered_one_bit_factors_, clustered_factor,
+                              n * sizeof(float), cudaMemcpyHostToDevice));
+        check_cuda(cudaMemcpy(d_clustered_doc_ids_, clustered_doc_ids,
+                              n * sizeof(int), cudaMemcpyHostToDevice));
+        check_cuda(cudaMemcpy(d_token_to_cluster_pos_, token_to_cluster_pos,
+                              n * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    }
+
+    if (uses_flat_centroid_route(options_.algorithm_variant)) {
+        if (!options_.expected_coarse_clusters || n_clusters != options_.expected_coarse_clusters)
+            throw std::invalid_argument("Flat algorithm ablation requires the explicitly declared coarse cluster count");
+        const auto& graph = *ivf->pg_index->index_cagra;
+        if (graph.size() != n_clusters || graph.dim() != PADDED_DIM)
+            throw std::invalid_argument("Exact flat ablation centroid matrix shape mismatch");
+        if (graph.metric() != cuvs::distance::DistanceType::L2Expanded)
+            throw std::invalid_argument("Exact flat ablation requires the original default L2Expanded metric");
+    }
+    compute_candidate_bounds();
+    allocate_workspace();
+    if (uses_flat_centroid_route(options_.algorithm_variant)) {
+        const auto matrix = ivf->pg_index->index_cagra->dataset();
+        ws_->flat_router = std::make_unique<FlatL2Router>(matrix.data_handle(), n_clusters, PADDED_DIM, matrix.stride(0), Q_DOCLEN);
+    }
+    std::cout << "[ALGORITHM_WORKSPACE] max_CG_documents=" << max_candidate_docs_
+              << " max_DS_documents=" << ws_->max_refined_candidates
+              << " max_DS_tokens=" << ws_->max_refined_tokens
+              << " token_score_bytes=" << ws_->max_refined_tokens * size_t(Q_DOCLEN) * sizeof(float)
+              << " CR_arena=" << (skips_candidate_refinement(options_.algorithm_variant) ? "absent" : "original")
+              << " flat_scratch_bytes=" << (ws_->flat_router ? ws_->flat_router->scratch_bytes() : 0) << '\n';
+    search_ready_ = true;
+}
+
+}  // namespace Chimera

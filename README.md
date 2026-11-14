@@ -1,26 +1,37 @@
-# Chimera+
+# Multi-query：Chimera / PLAID 多向量检索
 
-Chimera+ replaces only the CPU full-bit document scorer in the accepted ARM Chimera baseline with a CUDA scorer. Routing, candidate generation/refinement, 1bit scoring, chunk selection and the final CPU heap are unchanged. The existing index is loaded without conversion or rebuilding.
+当前项目统一位于 `/home/lxq/multi-query`。研究 DGX Spark（GB10、20核ARM、128GB UMA）上的多向量搜索，包含原Chimera、GPU完整4bit精排的Chimera+及官方PLAID GPU路径。
 
-The current GPU scorer supports the experiment's 4bit, D128, 32-query-token representation. It preserves the CPU nibble layout, FP32 FMA/addition tree, correction factors, per-query-token maxima and score ties. One CUDA block handles each selected document. On GB10, ATS lets the GPU read the existing full-code/factor arrays through host page tables; no second corpus allocation or FP32 expansion is made. Other supported CUDA mappings use registered host storage.
+## 入口
 
-- `--full-bit-device gpu` is the Chimera+ default.
-- `--full-bit-device cpu` invokes the unchanged CPU scoring body for comparison.
-- `--verify-full-bit` additionally replays exactly the same selected candidates on CPU and requires bitwise equal FP32 scores. This diagnostic must be disabled for performance measurements.
+- [统一实验报告](reports/lotte-r10-brief.md)：LoTTE R10/R100、平均/P99延迟和瓶颈。
+- [Chimera+单query流程图](reports/chimera-plus.md)：24次kernel调用、传输及同步。
+- [Chimera+源码说明](Chimera/README.md)。
 
-`BASELINE.json` identifies the imported experimental baseline. Git branch `baseline` preserves it; `Chimera+` contains this change. Source changes are limited to scoring, its workspace/lifetime and CLI integration, a standalone CMake guard, and numerical tests.
+| 路径 | 内容 |
+|---|---|
+| `Chimera/` | 当前Chimera+ C++/CUDA源码和数值测试 |
+| `systems/plaid/ColBERT-main/` | 官方ColBERT/PLAID源码 |
+| `systems/plaid/*.py` | 预编码数据接入、原生GPU搜索、验收与实验入口 |
+| `systems/chimera/` | ARM适配、原Chimera搜索/构建监督与验收工具 |
+| `systems/chimera-ms-sorted-gather/` | MS MARCO主索引恢复使用的冻结构建源码与工具 |
+| `systems/chimera-alg-ablation/source/` | 已测原Chimera二进制对应源码，正式模式为Full |
+| `configs/`、`scripts/` | 项目设置与数据准备入口 |
+| `reports/`、`report-assets/` | 当前报告、配图与绘图源码 |
+| `indexes/` | 本地索引，不提交Git |
+| `ai-workspace/` | 构建缓存、临时材料、迁移收据与状态，不提交Git |
+| `data` | 链接到 `/home/lxq/data/multivector-colbertv2` |
 
-Build outside the source tree with CUDA architecture 121, the existing cuVS/RMM toolchain and `CHIMERA_BUILD_PYTHON=OFF`. Targets: `gpu_search`, `fullbit_gpu_qualification`. The qualification compares actual CPU SIMD scoring with GPU output on nibble boundaries, reordered/repeated IDs, document lengths 1–300, negative scores, zero/tied scores and empty candidate batches.
+数据集、查询和真值在 `~/data/multivector-colbertv2/`；索引实际保存在本项目`indexes/`。数据目录里的旧`indexes`入口链接到此目录，构建缓存链接到本项目`ai-workspace/index-build-cache/`。
 
-Heavy builds and all GPU validation/performance measurements use an exclusive nonblocking `~/device.lock`, held until all associated work completes. Build directories, logs, test specifications and outputs live in `/home/lxq/graduate/ai-workspace/`; they are not source artifacts.
+## Git与兼容路径
 
-The four frozen LoTTE configurations (CPU20, chunks1) remain:
+项目已统一为一个Git仓库，当前分支`Chimera+`。原Chimera+提交`c97f24c`及`baseline`分支历史保留；本次迁移提交将源码归入`Chimera/`并纳入PLAID和实验工具。数据、索引、日志、环境和原始实验结果留在本地，不进Git。
 
-| Returned k | Recall target | nprobe | refine | full-bit | CAGRA itopk |
-|---:|---:|---:|---:|---:|---:|
-| 10 | .90 | 32 | 1000 | 20 | 64 |
-| 10 | .95 | 128 | 1000 | 50 | 160 |
-| 100 | .90 | 64 | 3000 | 300 | 96 |
-| 100 | .95 | 256 | 3000 | 300 | 288 |
+原graduate项目、运行工作区和数据目录保留符号链接。冻结实验规格、编译缓存和既有Python环境因此仍可通过旧绝对路径访问；迁移没有改写冻结源码、二进制或检查点。
 
-The single experiment report remains `/home/lxq/graduate/ai-workspace/research/multivector/report/lotte-r10-brief.md`.
+## 当前后台状态
+
+MS MARCO数据已完整下载。Chimera主4bit索引在迁移前已安全停止：142,344,192 / 597,909,919 tokens，2172个已提交批次。检查点保存在`ai-workspace/index-build-cache/`；PLAID全量MS主索引尚未开始。迁移后不自动恢复计算。
+
+继续重负载任务前按 `~/device.lock` 取得独占锁，同一时间只构建一个索引。新运行输出统一放`ai-workspace/`。现有`systems/`内历史运行材料按忽略规则保留，源码与必要配置由Git追踪。

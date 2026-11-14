@@ -1,0 +1,363 @@
+{
+  "paper": "https://arxiv.org/html/2608.23553v2",
+  "hardware": "NVIDIA DGX Spark GB10, ARM64, UMA",
+  "data_root": "/home/lxq/graduate/data",
+  "dataset": {
+    "repository": "tuskanny/lotte_pooled_colbertv2",
+    "revision": "e3745bd22a3be48d167c438fc8a7a839b86860b1",
+    "documents": 2428854,
+    "tokens": 266205513,
+    "queries": 2931,
+    "dimension": 128,
+    "query_length": 32,
+    "source_document_dtype": "uint16 carrying IEEE FP16 bits",
+    "source_query_dtype": "float32",
+    "observed_doclen_range": [
+      3,
+      180
+    ]
+  },
+  "measurement": {
+    "batch_size": 1,
+    "rounds": 3,
+    "warmup_queries": 32,
+    "topk": [
+      10,
+      100
+    ],
+    "recall_targets": {
+      "10": [
+        0.9,
+        0.95
+      ],
+      "100": [
+        0.9,
+        0.95,
+        0.99
+      ]
+    },
+    "qps": "queries / sum of completed synchronous search call times",
+    "aggregate": "arithmetic mean of three per-round QPS; retain each round mean and p99",
+    "ground_truth": "exhaustive FP32 MaxSim on the same released vectors, TF32 disabled",
+    "timing_excludes": [
+      "encoding",
+      "index loading",
+      "warmup",
+      "writing result files",
+      "recall calculation"
+    ],
+    "query_boundary": "host FP32 preencoded query to completed host top-k results; upload included",
+    "selection": "Tune search parameters for target recall; final Recall@10 and QPS use the full benchmark query set (LoTTE2931/MSMARCO6980), mean of 3 runs. No custom heldout split. Small query samples are exploratory only.",
+    "host_resources": {
+      "paper_threads": 32,
+      "primary": {
+        "threads": 20,
+        "cpus": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ],
+        "omp_place_order": [
+          7,
+          5,
+          6,
+          8,
+          9,
+          15,
+          16,
+          17,
+          18,
+          19,
+          0,
+          1,
+          2,
+          3,
+          4,
+          10,
+          11,
+          12,
+          13,
+          14
+        ]
+      },
+      "cpu_organization_controls": [
+        {
+          "threads": 1,
+          "cpus": [
+            7
+          ]
+        },
+        {
+          "threads": 4,
+          "cpus": [
+            5,
+            6,
+            7,
+            8
+          ]
+        },
+        {
+          "threads": 10,
+          "cpus": [
+            5,
+            6,
+            7,
+            8,
+            9,
+            15,
+            16,
+            17,
+            18,
+            19
+          ],
+          "note": "all10 X925 fastcores; compare heterogeneous20core organization"
+        }
+      ]
+    },
+    "warmup_policy": "default32; actual count is bound in each run receipt"
+  },
+  "chimera": {
+    "upstream_tree": "ddd781995f72211f3f71d025e5674a3c31ea9779",
+    "full_bits": [
+      4,
+      8
+    ],
+    "ex_bits": [
+      3,
+      7
+    ],
+    "cluster_candidates": [
+      1048576,
+      2097152
+    ],
+    "cluster_candidate_status": "local exploration grid; paper does not publish exact values",
+    "chunks": [
+      1,
+      2,
+      4,
+      6,
+      8,
+      10
+    ],
+    "nprobe": [
+      32,
+      64,
+      128,
+      256,
+      512
+    ],
+    "k_refine": [
+      1000,
+      2000,
+      3000,
+      4000,
+      8000,
+      10000,
+      20000,
+      40000,
+      100000
+    ],
+    "k_full_bit": [
+      100,
+      300,
+      400,
+      1000,
+      3000,
+      10000
+    ],
+    "port": "equivalent ARM CPU SIMD and FHT; mmap build input",
+    "kernel_nprobe_limit": 512,
+    "upstream_commit": "f6c3a7925924283fc0bc4da64ce78f9cf129bca6",
+    "search_grid_status": "staged exploration candidates; executed points in immutable per-run receipts; no Cartesian-product requirement",
+    "construction_ownership": {
+      "policy": "PG_CAGRA explicitly owns a device allocation containing the identical FP32 centroid matrix; graph destroyed before dataset",
+      "reason": "Spark ATS host-view path referenced the caller buffer; original final builder released it before save",
+      "binary_sha256": "8d95bcf8c3fa9628022620d85649eb6f30598a5830aed470b0b25a55b5e113c5",
+      "source_manifest_sha256": "995ba6a1a5ff9447d1e622bc2c325088c3dca95604c5d350fbd71eb4dbc03ab8",
+      "semantic_index_gate": "saved final rotated dataset must equal seed42 FhtKac matrix bitwise and receipt must bind centroids.carga SHA",
+      "optional_checkpoint": "original assignment batch65536/k1/itopk150 with persisted graph/labels; CPU/GPU small-scale continuation equivalence passed",
+      "old_index_policy": "ROUTING_DATASET_UNVERIFIED.json rejected by future runner; payloads preserved"
+    },
+    "chunk_paper_sweep": {
+      "chunks": [
+        1,
+        2,
+        4,
+        6,
+        8,
+        10
+      ],
+      "quality": "R100 .95; same frozen config first and report actual recall for each c",
+      "count_control": {
+        "k_full_bit": 400,
+        "k_refine": [
+          2000,
+          4000,
+          8000
+        ],
+        "statistic": "actual full-bit document scores perquery, sum of perchunk counts; mean/max/exceed400 count",
+        "timing": "separate observational counter binary; formal QPS retains uninstrumented binary"
+      }
+    },
+    "search_source": {
+      "binary_sha256": "c54539b5143f63ad96ab0118f165dded7861d9c5af180767cd74c66d7bd4945d",
+      "source_manifest_sha256": "6bfb61687d88d99d83dedf1baf8e5cd065073914e3e53d832baa153ed34bd337",
+      "algorithm_variant": "full",
+      "kernel_mode": "full",
+      "qualification": "4/8bit originalengine orderedIDs+FP32scorebits equivalence; low-memory8bit equivalence; chunk/zero-candidate safety",
+      "build_and_search_identities": "construction remains respective8d95/ecb75 frozenbuilders; searchABI independently rebuilt/qualified"
+    },
+    "kernel_ablation_modes": [
+      "full",
+      "no-lut",
+      "no-aggregation",
+      "neither"
+    ],
+    "algorithm_ablation_modes": [
+      "full",
+      "no-cr",
+      "no-ivf-pg",
+      "neither"
+    ],
+    "coarse_ablation_clusters": {
+      "lotte": 131072,
+      "policy": "sameactualofficialPLAID cluster count; newpostings; onlineFP32exactL2flat;CAGRA container/offlineassignment retained and disclosed"
+    }
+  },
+  "plaid": {
+    "implementation": "stanford-futuredata/ColBERT official ResidualCodec and IndexScorer",
+    "bits": [
+      4,
+      8
+    ],
+    "kmeans_iterations": 4,
+    "partitions": "2**floor(log2(16*sqrt(num_token_vectors)))",
+    "ncells": [
+      4,
+      8,
+      16,
+      32,
+      64
+    ],
+    "ndocs": [
+      1024,
+      2048,
+      4096,
+      8192
+    ],
+    "centroid_score_threshold": [
+      0.45,
+      0.3,
+      0.0
+    ],
+    "training_scope": "full corpus: official default4 iterations and official sampled-doc policy; prefix100k: explicit20 diagnostic",
+    "grid_order": "full 60 points shuffled seed42; repeat top eligible candidates before freezing; native placement calibrated independently",
+    "high_recall_extension": {
+      "ncells": [
+        16,
+        32,
+        64,
+        128
+      ],
+      "ndocs": [
+        16384,
+        32768,
+        65536
+      ],
+      "policy": "progressive calibration-only extension for8bit R100 .99"
+    }
+  },
+  "additional_dataset": {
+    "msmarco": {
+      "repository": "tuskanny/ms_marco_colbertv2",
+      "revision": "f8540899613ccc13049ac87db1cc4041a1dc4e31",
+      "documents": 8841823,
+      "tokens": 597909919,
+      "queries": 6980,
+      "query_ids": "external MSMARCO qids; ANN results use row IDs",
+      "observed_doclen_range": [
+        4,
+        300
+      ]
+    },
+    "hotpotqa": {
+      "paper_documents": 5233329,
+      "paper_tokens_approx": 283000000,
+      "paper_queries": 1000,
+      "status": "exact preprocessing and query subset unavailable; source differences documented"
+    }
+  },
+  "hardware_capabilities": {
+    "device0": {
+      "PageableMemoryAccess": 1,
+      "PageableMemoryAccessUsesHostPageTables": 1,
+      "ConcurrentManagedAccess": 1,
+      "HostNativeAtomicSupported": 1,
+      "UnifiedAddressing": 1,
+      "Integrated": 1,
+      "CanMapHostMemory": 1
+    },
+    "normal_pageable_host_pointer_probe": {
+      "type": "Unregistered",
+      "devicePointer": null,
+      "allocation_bytes": 4096
+    },
+    "probe_scope": "CUDA driver/runtime attribute calls only; no allocation/kernel/synchronization",
+    "evidence": "/home/lxq/multi-query/systems/chimera/review/cuda-host-attributes/result.json",
+    "actual_cuvs_host_dataset_pointer_probe": {
+      "context": "live CAGRA graph built from caller std::vector centroid matrix",
+      "aliases_caller_buffer": true,
+      "cuda_memory_type": "Unregistered",
+      "devicePointer_equals_hostPointer_nonnull": true,
+      "implication": "caller memory lifetime must cover all graph uses including serialization"
+    }
+  },
+  "execution_policy": {
+    "max_concurrent_index_builds": 1,
+    "cpu_requantization_counts_as_index_build": true,
+    "construction_and_formal_search_must_not_overlap": true,
+    "shared_exclusive_lock": "/home/lxq/device.lock",
+    "cohort_build_launches_allowed": false,
+    "delivery_priority": [
+      "LoTTE full main E2E first",
+      "MS MARCO after first LoTTE delivery"
+    ],
+    "coarse_ablation_build": "checkpoint stopped at user request; resume later serially",
+    "document_review": "existing doc-review after the delivery batch tests complete, before publishing its report",
+    "first_delivery": {
+      "dataset": "LoTTE full",
+      "bits": 4,
+      "topk": 10,
+      "recall10": [
+        0.9,
+        0.95
+      ],
+      "QPS": "best eligible measured calibrationconfiguration, formalB1x3",
+      "bottleneck": "NSYS stages + targetedNCU major kernels",
+      "calibration_method": "minimize actual endtoendwall includingimplementation+validation; B1orboundedconcurrentqueryscreen; finalrankingB1",
+      "later": [
+        "Recall@100",
+        "8bit",
+        "MS MARCO",
+        "algorithm/kernelablations"
+      ]
+    }
+  }
+}
