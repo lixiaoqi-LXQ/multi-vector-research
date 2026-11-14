@@ -103,11 +103,11 @@ L2请求带宽不是LPDDR总线带宽。读取未命中估算未包含写回，�
 <summary>全流程采集命令与原始计数</summary>
 
 ```sh
-/usr/local/cuda/bin/ncu --target-processes all --profile-from-start off --launch-count 24 --cache-control none --disable-extra-suffixes --metrics gpu__time_duration.sum,lts__t_bytes.sum,smsp__sass_thread_inst_executed_op_ffma_pred_on.sum,smsp__sass_thread_inst_executed_op_fadd_pred_on.sum,smsp__sass_thread_inst_executed_op_fmul_pred_on.sum --force-overwrite --export /home/lxq/multi-vector-research/systems/chimera-plus/profile-r100-p95/ncuflow/counters /home/lxq/graduate/.venv/bin/python /home/lxq/multi-vector-research/systems/chimera/profile-v2/leaf_exec.py /home/lxq/multi-vector-research/systems/chimera-plus/profile-r100-p95/ncuflow/tree-config.json
+/usr/local/cuda/bin/ncu --target-processes all --profile-from-start off --launch-count 24 --cache-control none --disable-extra-suffixes --metrics gpu__time_duration.sum,lts__t_bytes.sum,smsp__sass_thread_inst_executed_op_ffma_pred_on.sum,smsp__sass_thread_inst_executed_op_fadd_pred_on.sum,smsp__sass_thread_inst_executed_op_fmul_pred_on.sum --force-overwrite --export /home/lxq/multi-vector-research/local/legacy-systems/chimera-plus/profile-r100-p95/ncuflow/counters /home/lxq/graduate/.venv/bin/python /home/lxq/multi-vector-research/systems/chimera/profile-v2/leaf_exec.py /home/lxq/multi-vector-research/local/legacy-systems/chimera-plus/profile-r100-p95/ncuflow/tree-config.json
 ```
 
 ```sh
-/usr/local/cuda/bin/ncu --target-processes all --profile-from-start off --launch-count 24 --cache-control none --disable-extra-suffixes --metrics gpu__time_duration.sum,lts__t_bytes.sum,lts__t_sectors_op_read_lookup_miss.sum,lts__t_sectors_aperture_sysmem_op_read_lookup_miss.sum,lts__t_sectors_op_write.sum --force-overwrite --export /home/lxq/multi-vector-research/systems/chimera-plus/profile-r100-p95/memflow/counters /home/lxq/graduate/.venv/bin/python /home/lxq/multi-vector-research/systems/chimera/profile-v2/leaf_exec.py /home/lxq/multi-vector-research/systems/chimera-plus/profile-r100-p95/memflow/tree-config.json
+/usr/local/cuda/bin/ncu --target-processes all --profile-from-start off --launch-count 24 --cache-control none --disable-extra-suffixes --metrics gpu__time_duration.sum,lts__t_bytes.sum,lts__t_sectors_op_read_lookup_miss.sum,lts__t_sectors_aperture_sysmem_op_read_lookup_miss.sum,lts__t_sectors_op_write.sum --force-overwrite --export /home/lxq/multi-vector-research/local/legacy-systems/chimera-plus/profile-r100-p95/memflow/counters /home/lxq/graduate/.venv/bin/python /home/lxq/multi-vector-research/systems/chimera/profile-v2/leaf_exec.py /home/lxq/multi-vector-research/local/legacy-systems/chimera-plus/profile-r100-p95/memflow/tree-config.json
 ```
 
 ```csv
